@@ -113,6 +113,9 @@ class TAMPConfiguration:
     enable_experiment_logging: bool = True
     # Root directory for logging experiments
     experiment_root: str = "/tmp/cutamp-experiments"
+    # Save a factor-graph representation (JSON + Graphviz DOT) of the final solved plan skeleton
+    # into the experiment directory. See cutamp/plan_graph.py.
+    save_plan_graph: bool = False
 
 
 def validate_tamp_config(config: TAMPConfiguration):

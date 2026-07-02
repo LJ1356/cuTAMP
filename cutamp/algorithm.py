@@ -392,6 +392,48 @@ def setup_cutamp(
     return exp_logger, visualizer, timer, world
 
 
+def _save_final_plan_graph(plan_skeleton, plan_info, world, config, constraint_checker, exp_logger, found_solution):
+    """Build and save a factor-graph representation (JSON + DOT) of a plan skeleton.
+
+    Optionally annotates the constraint/cost factors with concrete values by rolling out the
+    skeleton's current particles and selecting a satisfying particle when one exists.
+    """
+    from cutamp.plan_graph import build_plan_graph, save_plan_graph
+
+    exp_dir = getattr(exp_logger, "exp_dir", None)
+    if not isinstance(exp_dir, Path):
+        _log.warning("save_plan_graph requested but no experiment directory is available (logging disabled?)")
+        return
+
+    cost_dict = None
+    particle_idx = None
+    if plan_info is not None:
+        try:
+            with torch.no_grad():
+                rollout = plan_info["rollout_fn"](plan_info["particles"])
+                cost_dict = plan_info["cost_fn"](rollout)
+                mask = constraint_checker.get_mask(cost_dict, verbose=False)
+                if bool(mask.any()):
+                    particle_idx = int(torch.nonzero(mask, as_tuple=False)[0].item())
+        except Exception as e:
+            _log.warning(f"Failed to compute cost dict for plan graph enrichment: {e}")
+            cost_dict = None
+
+    graph = build_plan_graph(
+        plan_skeleton,
+        name=world.env.name,
+        env=world.env,
+        initial_state=world.initial_state,
+        goal_state=world.goal_state,
+        cost_dict=cost_dict,
+        constraint_checker=constraint_checker,
+        particle_idx=particle_idx,
+        solved=found_solution,
+    )
+    paths = save_plan_graph(graph, exp_dir)
+    _log.info("Saved plan graph: " + ", ".join(f"{k}={v}" for k, v in paths.items()))
+
+
 def run_cutamp(
     env: TAMPEnvironment,
     config: TAMPConfiguration,
@@ -467,6 +509,9 @@ def run_cutamp(
         "best_soft_cost": float("inf"),
     }
     found_solution = False
+    # Track the final skeleton (and its particle container) for the plan-graph export.
+    final_plan_skeleton = None
+    final_plan_info = None
     particle_optimizer = ParticleOptimizer(config, cost_reducer, constraint_checker)
     timer.start("first_solution")
     if found_solution_initially:
@@ -663,6 +708,8 @@ def run_cutamp(
 
             overall_metrics["num_satisfying_final"] = metrics["num_satisfying_final"]
             overall_metrics["final_plan_skeleton"] = [str(op) for op in plan_skeleton]
+            final_plan_skeleton = plan_skeleton
+            final_plan_info = plan_info
             _log.debug(f"Total num satisfying {metrics['num_satisfying_final']}")
             if config.curobo_plan and curobo_plan is None:
                 # Motion refinement failed, try next skeleton. Intentionally overrides should_break
@@ -711,6 +758,24 @@ def run_cutamp(
                 )
         _log.warning(failure_reason)
     _log.debug(f"Best cost: {overall_metrics['best_cost']:.4f}, soft cost: {overall_metrics['best_soft_cost']:.4f}")
+
+    # Save a factor-graph representation of the final plan skeleton, if requested. Falls back to
+    # the best-heuristic skeleton (marked unsolved) when no satisfying skeleton was found.
+    if config.save_plan_graph:
+        graph_skeleton = final_plan_skeleton
+        graph_plan_info = final_plan_info
+        if graph_skeleton is None and plan_queue:
+            graph_plan_info = plan_queue[0]
+            graph_skeleton = graph_plan_info["plan_skeleton"]
+        if graph_skeleton is not None:
+            try:
+                _save_final_plan_graph(
+                    graph_skeleton, graph_plan_info, world, config, constraint_checker, exp_logger, found_solution
+                )
+            except Exception as e:
+                _log.warning(f"Failed to save plan graph: {e}")
+        else:
+            _log.warning("save_plan_graph requested but no plan skeleton was available")
 
     # Dump metrics out
     overall_metrics["found_solution"] = found_solution
