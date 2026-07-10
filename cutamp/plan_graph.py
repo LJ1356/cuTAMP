@@ -593,6 +593,270 @@ def build_plan_graph(
 
 
 # ---------------------------------------------------------------------------
+# Paper-style views (Garrett et al., "Integrated Task and Motion Planning",
+# arXiv:2010.01083)
+# ---------------------------------------------------------------------------
+# The plan graph is a bipartite factor graph; the survey draws two views of it:
+#   * Figure 8 -- the *plan skeleton* as a **dynamic factor graph**: one column
+#     per state s0..sk, one row per state variable (robot config, holding, object
+#     poses) with the motion parameters on a partial top row; round nodes are state
+#     variables (grey = constant, colored = free), rectangles are the constraints
+#     between adjacent states, and thick black lines are equality constraints that
+#     persist a variable's value across steps.
+#   * Figure 9 -- the *simplified constraint network*: a bipartite graph from the
+#     (geometric) free parameters to the constraints, with constants/objects and
+#     redundant structure removed.
+# ``build_skeleton_layout`` reconstructs both from a plan graph by simulating the
+# operator effects, so the interactive HTML can render them faithfully.
+
+# One distinct color per free (decision) variable, cycled. Constants render grey.
+_FIG_PALETTE = [
+    "#e6564e", "#f2953a", "#efc73b", "#7cbf4d", "#2fbcc4", "#4f86e8",
+    "#9b6ce0", "#e070b0", "#2bb389", "#c98a3e", "#6d7f96", "#d24f86",
+    "#8fca3f", "#5ac5d8", "#b07de0", "#e8894a", "#69b0a0", "#c56ad0",
+]
+_FIG_CONST_FILL = "#d3d7dd"
+
+
+def _fig_short(name: str) -> str:
+    """Compact object name for row/holding labels (pink_toy -> pink)."""
+    for suffix in ("_toy", "_block", "_cube", "_object"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def _fig_var_label(name: Optional[str], vtype: Optional[str]) -> str:
+    """Paper-style short label: conf->q, traj->tau, grasp->g, pose->p (keeps the index)."""
+    if name is None:
+        return "∅"  # empty hand
+    m = re.match(r"^([A-Za-z_]+?)(\d+)$", name)
+    idx = m.group(2) if m else ""
+    prefix = {"traj": "τ", "grasp": "g", "pose": "p", "conf": "q"}.get(vtype or "")
+    return (prefix + idx) if prefix else name
+
+
+def build_skeleton_layout(graph: dict) -> dict:
+    """Reconstruct the Fig. 8 (dynamic factor graph) and Fig. 9 (constraint network) models.
+
+    Returns a JSON-serializable dict consumed by the interactive HTML. On any failure it
+    returns ``{"ok": False, "reason": ...}`` so HTML generation never breaks.
+    """
+    try:
+        return _build_skeleton_layout(graph)
+    except Exception as e:  # pragma: no cover - defensive; the HTML degrades gracefully
+        _log.warning("Could not build paper-style skeleton layout: %s", e)
+        return {"ok": False, "reason": str(e)}
+
+
+def _build_skeleton_layout(graph: dict) -> dict:
+    nodes = graph.get("nodes", [])
+    ops = sorted((n for n in nodes if n.get("kind") == "operator"), key=lambda n: n.get("step", 0))
+    if not ops:
+        return {"ok": False, "reason": "no operators in plan"}
+    var_nodes = {n["name"]: n for n in nodes if n.get("kind") == "variable"}
+    con_nodes = [n for n in nodes if n.get("kind") == "constraint"]
+
+    def vtype(name):
+        vn = var_nodes.get(name)
+        return vn.get("var_type") if vn else None
+
+    def param(op):
+        return dict(zip(op.get("param_names", []), op.get("values", [])))
+
+    # --- one color per free decision variable, in first-appearance order --------
+    color_of: Dict[str, str] = {}
+    for op in ops:
+        for v in op.get("values", []):
+            if v in color_of:
+                continue
+            vn = var_nodes.get(v)
+            if vn is None or vn.get("var_class") != "decision" or vn.get("fixed"):
+                continue  # objects/surfaces and the fixed initial config q0 are constants
+            color_of[v] = _FIG_PALETTE[len(color_of) % len(_FIG_PALETTE)]
+
+    # --- movable objects (tracked as at[obj] rows), in first-appearance order ----
+    movables: List[str] = []
+    for op in ops:
+        o = param(op).get("obj")
+        if o and o not in movables and var_nodes.get(o, {}).get("var_class") == "object":
+            movables.append(o)
+
+    num_states = len(ops) + 1
+    start_q = param(ops[0]).get("q_start") or param(ops[0]).get("q") or param(ops[0]).get("q_end")
+
+    # --- simulate the state trajectory ------------------------------------------
+    atRob: List[Optional[str]] = [None] * num_states
+    holding: List[Optional[str]] = [None] * num_states
+    init_pose = {m: f"__init__::{m}" for m in movables}
+    obj_at: Dict[str, List[Optional[str]]] = {m: [None] * num_states for m in movables}
+
+    atRob[0] = start_q
+    holding[0] = None
+    for m in movables:
+        obj_at[m][0] = init_pose[m]
+
+    for i, op in enumerate(ops):
+        p = param(op)
+        name = op.get("name")
+        atRob[i + 1] = atRob[i]
+        holding[i + 1] = holding[i]
+        for m in movables:
+            obj_at[m][i + 1] = obj_at[m][i]
+        if name in ("MoveFree", "MoveHolding"):
+            atRob[i + 1] = p.get("q_end", atRob[i])
+        elif name == "Pick":
+            o = p.get("obj")
+            holding[i + 1] = o
+            if o in obj_at:
+                obj_at[o][i + 1] = p.get("grasp")
+        elif name == "Place":
+            o = p.get("obj")
+            holding[i + 1] = None
+            if o in obj_at:
+                obj_at[o][i + 1] = p.get("placement")
+        # Push / PushStick actuate a button; no config/holding/pose state change tracked here.
+
+    # --- rows + cells ------------------------------------------------------------
+    rows = [
+        {"key": "atRob", "label": "atRob", "geometric": True},
+        {"key": "holding", "label": "holding", "geometric": False},
+    ]
+    for m in movables:
+        rows.append({"key": f"at:{m}", "label": f"at[{_fig_short(m)}]", "geometric": True})
+
+    cells: List[dict] = []
+    cell_index: Dict[tuple, dict] = {}
+
+    def make_cell(row_key, col, value):
+        if value in color_of:
+            label, kind, color = _fig_var_label(value, vtype(value)), "var", color_of[value]
+        elif isinstance(value, str) and value.startswith("__init__::"):
+            label, kind, color = "p⁰", "const", _FIG_CONST_FILL  # object's initial pose
+        elif value is None:
+            label, kind, color = "∅", "const", _FIG_CONST_FILL    # empty hand
+        elif var_nodes.get(value, {}).get("var_class") == "object":
+            label, kind, color = _fig_short(value), "const", _FIG_CONST_FILL
+        else:
+            label = _fig_var_label(value, vtype(value)) if vtype(value) else str(value)
+            kind, color = "const", _FIG_CONST_FILL                      # constant config (q0), etc.
+        cell = {
+            "id": f"c::{row_key}::{col}", "row": row_key, "col": col, "label": label,
+            "kind": kind, "color": color, "value": value,
+            "var": (f"var::{value}" if value in var_nodes else None),
+        }
+        cells.append(cell)
+        cell_index[(row_key, col)] = cell
+
+    for col in range(num_states):
+        make_cell("atRob", col, atRob[col])
+        make_cell("holding", col, holding[col])
+        for m in movables:
+            make_cell(f"at:{m}", col, obj_at[m][col])
+
+    # --- motion parameters: partial top row, one cell per move action's gap ------
+    motion_cells: List[dict] = []
+    for i, op in enumerate(ops):
+        if op.get("name") not in ("MoveFree", "MoveHolding"):
+            continue
+        traj = param(op).get("traj")
+        if traj is None:
+            continue
+        motion_cells.append({
+            "id": f"m::{i}", "gap": i, "value": traj,
+            "label": _fig_var_label(traj, "traj"),
+            "kind": "var" if traj in color_of else "const",
+            "color": color_of.get(traj, _FIG_CONST_FILL),
+            "var": (f"var::{traj}" if traj in var_nodes else None),
+        })
+
+    # --- equality (persistence) links on the geometric rows ----------------------
+    equal: List[list] = []
+    for r in rows:
+        if not r["geometric"]:
+            continue
+        for col in range(num_states - 1):
+            a = cell_index[(r["key"], col)]
+            b = cell_index[(r["key"], col + 1)]
+            if a["value"] is not None and a["value"] == b["value"]:
+                equal.append([a["id"], b["id"]])
+
+    # --- constraints -> the specific cells they touch (Fig. 8) -------------------
+    by_value: Dict[Any, List[tuple]] = {}
+    for c in cells:
+        by_value.setdefault(c["value"], []).append((c["col"], c["id"]))
+    for mc in motion_cells:
+        by_value.setdefault(mc["value"], []).append((mc["gap"] + 0.5, mc["id"]))
+
+    def resolve(value, gap):
+        cand = by_value.get(value)
+        if not cand:
+            return None
+        return min(cand, key=lambda t: abs(t[0] - (gap + 0.5)))[1]
+
+    fig8_constraints: List[dict] = []
+    for cn in con_nodes:
+        gap = cn.get("op_step", 0)
+        ids: List[str] = []
+        for pval in cn.get("params", []):
+            cid = resolve(pval, gap)
+            if cid and cid not in ids:
+                ids.append(cid)
+        fig8_constraints.append({
+            "id": cn["id"], "ctype": cn["ctype"], "gap": gap, "cells": ids,
+            "removable": cn.get("removable"),
+        })
+
+    actions = [{"step": i, "label": op.get("name"), "gap": i} for i, op in enumerate(ops)]
+
+    # --- simplified constraint network (Fig. 9) ---------------------------------
+    # Keep only the geometric free parameters (conf/traj/grasp/pose incl. the fixed q0);
+    # objects/surfaces and boolean fluents are dropped, as in the survey.
+    cnet_order: List[str] = []
+    cnet_seen = set()
+    for op in ops:
+        for v in op.get("values", []):
+            vn = var_nodes.get(v)
+            if vn and vn.get("var_class") == "decision" and v not in cnet_seen:
+                cnet_seen.add(v)
+                cnet_order.append(v)
+    cnet_vars = [
+        {
+            "id": f"v::{v}", "var": f"var::{v}", "label": _fig_var_label(v, vtype(v)),
+            "color": color_of.get(v, _FIG_CONST_FILL),
+            "kind": "const" if var_nodes.get(v, {}).get("fixed") else "var",
+        }
+        for v in cnet_order
+    ]
+    cnet_constraints: List[dict] = []
+    for cn in con_nodes:
+        vs: List[str] = []
+        for pval in cn.get("params", []):
+            if pval in cnet_seen:
+                vid = f"v::{pval}"
+                if vid not in vs:
+                    vs.append(vid)
+        if vs:
+            cnet_constraints.append({
+                "id": cn["id"], "ctype": cn["ctype"], "vars": vs,
+                "removable": cn.get("removable"),
+            })
+
+    return {
+        "ok": True,
+        "states": [{"idx": i, "label": f"s{i}"} for i in range(num_states)],
+        "rows": rows,
+        "motionRowLabel": "τ",
+        "cells": cells,
+        "motionCells": motion_cells,
+        "equal": equal,
+        "actions": actions,
+        "constraints": fig8_constraints,
+        "cnet": {"vars": cnet_vars, "constraints": cnet_constraints},
+    }
+
+
+# ---------------------------------------------------------------------------
 # Serialization
 # ---------------------------------------------------------------------------
 
@@ -815,6 +1079,31 @@ __VIS_SCRIPT__
   details.ref .rlead{font-weight:600}
   details.ref .rprose{font-size:12px;color:#3c4043;margin:5px 0;line-height:1.45}
   .refkind{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:7px;vertical-align:-1px}
+
+  /* ---- paper-style views (Fig. 8 plan skeleton / Fig. 9 constraint network) ---- */
+  #viewport{flex:1;position:relative;min-height:0;background:
+     radial-gradient(circle at 1px 1px,#e9ebf0 1px,transparent 0) 0 0/22px 22px, #fbfcfe}
+  #network{position:absolute;inset:0}
+  .figwrap{position:absolute;inset:0;overflow:auto;display:none;background:
+     radial-gradient(circle at 1px 1px,#e9ebf0 1px,transparent 0) 0 0/22px 22px, #fbfcfe}
+  .figwrap.on{display:block}
+  .figwrap svg{display:block}
+  .figwrap svg text{user-select:none}
+  .fig-node{cursor:pointer}
+  .fig-con{cursor:pointer}
+  .fig-rowlabel{font-family:var(--mono);font-size:12px;fill:#5a6068}
+  .fig-action{font-size:12.5px;font-weight:650;fill:#232833}
+  .fig-state{font-size:13px;font-style:italic;fill:#8a909a}
+  .fig-caption{font-size:12px;fill:#8a909a}
+  #figlegend{position:absolute;left:14px;bottom:14px;background:rgba(255,255,255,0.96);border:1px solid var(--line);
+     border-radius:10px;padding:9px 12px;box-shadow:0 2px 10px rgba(20,25,40,.08);display:none;font-size:12px;z-index:5;max-width:280px}
+  #figlegend .fl-title{font-weight:650;margin-bottom:6px}
+  #figlegend .fl-row{display:flex;align-items:center;gap:8px;margin:4px 0;color:#3c4043}
+  #figlegend .fl-dot{width:16px;height:16px;border-radius:999px;flex:none;border:1.4px solid #2b2f36}
+  #figlegend .fl-dot.const{background:#d3d7dd;border-color:#b0b6be}
+  #figlegend .fl-rect{width:20px;height:13px;border-radius:3px;background:#fff;border:1.3px solid #3a3f47;flex:none}
+  #figlegend .fl-eq{width:20px;height:0;border-top:4px solid #202124;flex:none}
+  #figlegend .fl-note{color:#6b7280;margin-top:6px;font-size:11.5px;line-height:1.35}
 </style>
 </head>
 <body>
@@ -829,6 +1118,11 @@ __VIS_SCRIPT__
         </div>
       </div>
       <div class="tools">
+        <div class="seg" id="viewSeg" title="Switch between the paper-style views and the interactive factor graph">
+          <button data-view="skeleton" class="on">Plan skeleton</button>
+          <button data-view="cnet">Constraint network</button>
+          <button data-view="factorgraph">Factor graph</button>
+        </div>
         <div class="seg" id="layoutSeg">
           <button data-mode="timeline" class="on">Timeline</button>
           <button data-mode="force">Force</button>
@@ -840,13 +1134,18 @@ __VIS_SCRIPT__
         <button id="btn-reset" class="btn">Clear</button>
       </div>
     </header>
+    <div id="viewport">
     <div id="network"></div>
+    <div id="skeleton" class="figwrap"></div>
+    <div id="constraintnet" class="figwrap"></div>
     <div id="remlegend">
       <div class="rl-title">Constraint removability</div>
       <div class="rl-row"><span class="rl-sw" style="background:#0f9d58"></span>removable — changes the data distribution</div>
       <div class="rl-row"><span class="rl-sw" style="background:#f4b400"></span>no-op — relax via tolerance instead</div>
       <div class="rl-row"><span class="rl-sw" style="background:#db4437"></span>structural — required, can't remove</div>
       <div class="rl-title" style="font-weight:400;color:#6b7280;margin-top:6px">Other nodes dimmed. Click a factor for details.</div>
+    </div>
+    <div id="figlegend"></div>
     </div>
     <div id="hintbar">Click a node or edge for details · drag to rearrange · scroll to zoom · use Legend&nbsp;&amp;&nbsp;filters to declutter</div>
   </section>
@@ -878,6 +1177,7 @@ __VIS_SCRIPT__
 <script>
 const GRAPH = __GRAPH_JSON__;
 const DOCS = __DOCS_JSON__;
+const SKELETON = __SKELETON_JSON__;
 
 // ---- style maps (kept in sync with the Python DOT styling) -------------------
 const NODE_STYLE = {
@@ -1222,7 +1522,270 @@ ref+=`<h3>Costs — soft factors</h3>`;
 for(const [k,v] of Object.entries(DOCS.costs)) ref+=refEntry(k,v,refParamsList(v.params),"#8b5cf6",k);
 document.getElementById("reference").innerHTML=ref;
 
-network.once("afterDrawing",()=>network.fit());
+// =============================================================================
+// Paper-style views: Fig. 8 plan skeleton (dynamic factor graph) and Fig. 9
+// simplified constraint network. Rendered as SVG from the SKELETON model that
+// Python reconstructs (build_skeleton_layout). vis-network is used only for the
+// "Factor graph" view.
+// =============================================================================
+let viewMode = "skeleton";
+let figSelected = null;
+const figScale = {skeleton:0, cnet:0};      // 0 => needs a fit-to-width
+const figNatural = {skeleton:[0,0], cnet:[0,0]};
+const REMSVG = {free:{b:"#0f9d58",bg:"#d6f5e3"}, noop:{b:"#f4b400",bg:"#fff3cd"}, structural:{b:"#db4437",bg:"#fbdcd9"}};
+function figShort(n){ return String(n).replace(/_toy$|_block$|_cube$|_object$/,""); }
+// Compact constraint names for the figures (echoing the survey's Kin / CFree / Stable).
+// Full names remain in the hover tooltip and the Details panel.
+const CON_SHORT={KinematicConstraint:"Kin", CollisionFree:"CFree", CollisionFreeGrasp:"CFreeGrasp",
+  CollisionFreeHolding:"CFreeHold", CollisionFreePlacement:"CFreePlace", StablePlacement:"Stable",
+  ValidPush:"Push", ValidPushStick:"PushStick"};
+function conShort(t){ return CON_SHORT[t]||t; }
+
+// ---- Fig. 8 : plan skeleton (dynamic factor graph) ---------------------------
+const SKG = {colW:132, rowH:64, leftPad:112, rightPad:46, actionY:24, motionY:62, rowsTop:110, cellR:18, motionR:15, botPad:52};
+function skeletonKeep(sel){
+  if(!sel) return null;
+  const keep=new Set([sel]);
+  const con=SKELETON.constraints.find(k=>k.id===sel);
+  if(con){ con.cells.forEach(id=>keep.add(id)); }
+  else{
+    SKELETON.constraints.forEach(k=>{ if(k.cells.indexOf(sel)>=0) keep.add(k.id); });
+    SKELETON.equal.forEach(p=>{ if(p[0]===sel)keep.add(p[1]); if(p[1]===sel)keep.add(p[0]); });
+  }
+  return keep;
+}
+function renderSkeleton(){
+  const S=SKELETON, wrap=document.getElementById("skeleton");
+  if(!S||!S.ok){ wrap.innerHTML='<div style="padding:26px;color:#6b7280">Plan-skeleton view unavailable for this graph.</div>'; return; }
+  const nStates=S.states.length, nRows=S.rows.length;
+  const rowIdx={}; S.rows.forEach((r,i)=>rowIdx[r.key]=i);
+  const cx=c=>SKG.leftPad+c*SKG.colW, gx=g=>SKG.leftPad+(g+0.5)*SKG.colW, rowY=k=>SKG.rowsTop+rowIdx[k]*SKG.rowH;
+  const W=SKG.leftPad+(nStates-1)*SKG.colW+SKG.rightPad;
+  const stateY=SKG.rowsTop+(nRows-1)*SKG.rowH+SKG.botPad, H=stateY+22;
+  const pos={};
+  S.cells.forEach(c=>pos[c.id]={x:cx(c.col),y:rowY(c.row)});
+  S.motionCells.forEach(c=>pos[c.id]={x:gx(c.gap),y:SKG.motionY});
+  const conW=t=>Math.max(42,conShort(t).length*6.2+16), byGap={};
+  S.constraints.forEach(k=>{(byGap[k.gap]=byGap[k.gap]||[]).push(k);});
+  const conPos={};
+  Object.keys(byGap).forEach(g=>{
+    const list=byGap[g];
+    list.forEach(k=>{ const ys=k.cells.map(id=>pos[id]&&pos[id].y).filter(v=>v!=null);
+                      k._y=ys.length?ys.reduce((a,b)=>a+b,0)/ys.length:SKG.rowsTop; });
+    list.sort((a,b)=>a._y-b._y);
+    for(let i=1;i<list.length;i++){ if(list[i]._y-list[i-1]._y<34) list[i]._y=list[i-1]._y+34; }
+    list.forEach(k=>conPos[k.id]={x:gx(k.gap),y:k._y,w:conW(k.ctype)});
+  });
+  const rem=removableOn, keep=rem?null:skeletonKeep(figSelected), dim=id=>keep&&!keep.has(id)?0.12:1;
+  let out=`<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" font-family="Inter,system-ui,sans-serif">`;
+  S.equal.forEach(p=>{ const a=pos[p[0]],b=pos[p[1]]; if(!a||!b)return;
+    const op=rem?0.14:(keep?((keep.has(p[0])&&keep.has(p[1]))?1:0.08):1);
+    out+=`<line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" stroke="#202124" stroke-width="4" opacity="${op}"/>`; });
+  S.constraints.forEach(k=>{ const cp=conPos[k.id]; if(!cp)return;
+    k.cells.forEach(id=>{ const p=pos[id]; if(!p)return;
+      const op=rem?0.18:(keep?((keep.has(k.id)&&keep.has(id))?0.9:0.06):0.75);
+      out+=`<line x1="${cp.x}" y1="${cp.y}" x2="${p.x}" y2="${p.y}" stroke="#9aa3af" stroke-width="1" opacity="${op}"/>`; }); });
+  function drawCell(c,r){ const p=pos[c.id], isVar=c.kind==="var";
+    out+=`<g class="fig-node" data-node="${c.id}" opacity="${rem?0.28:dim(c.id)}">`
+       +`<circle cx="${p.x}" cy="${p.y}" r="${r}" fill="${c.color}" stroke="${isVar?"#2b2f36":"#b0b6be"}" stroke-width="1.5"/>`
+       +`<text x="${p.x}" y="${p.y+4}" text-anchor="middle" font-size="12.5" font-weight="600" fill="${isVar?"#14212c":"#5a6068"}">${esc(c.label)}</text>`
+       +`<title>${esc(c.label)}</title></g>`; }
+  S.cells.forEach(c=>drawCell(c,SKG.cellR));
+  S.motionCells.forEach(c=>drawCell(c,SKG.motionR));
+  S.constraints.forEach(k=>{ const cp=conPos[k.id]; if(!cp)return;
+    const w=cp.w,h=22,x=cp.x-w/2,y=cp.y-h/2; let fill="#ffffff",stroke="#3a3f47",sw=1.3,op=1;
+    if(rem){ const st=REMSVG[k.removable||"structural"]||REMSVG.structural; fill=st.bg; stroke=st.b; sw=2.1; } else op=dim(k.id);
+    out+=`<g class="fig-con" data-node="${k.id}" opacity="${op}">`
+       +`<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="4" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>`
+       +`<text x="${cp.x}" y="${cp.y+3.5}" text-anchor="middle" font-size="10.5" fill="#33383f">${esc(conShort(k.ctype))}</text>`
+       +`<title>${esc(k.ctype)}</title></g>`; });
+  S.rows.forEach(r=>{ out+=`<text class="fig-rowlabel" x="${SKG.leftPad-26}" y="${rowY(r.key)+4}" text-anchor="end">${esc(r.label)}</text>`; });
+  out+=`<text class="fig-rowlabel" x="${SKG.leftPad-26}" y="${SKG.motionY+4}" text-anchor="end">${esc(S.motionRowLabel)}</text>`;
+  S.actions.forEach(a=>{ out+=`<text class="fig-action" x="${gx(a.gap)}" y="${SKG.actionY}" text-anchor="middle">${esc(a.label)}</text>`; });
+  S.states.forEach(s=>{ out+=`<text class="fig-state" x="${cx(s.idx)}" y="${stateY}" text-anchor="middle">${esc(s.label)}</text>`; });
+  out+=`</svg>`;
+  wrap.innerHTML=out; figNatural.skeleton=[W,H]; applyFigScale("skeleton");
+  wrap.querySelectorAll("[data-node]").forEach(g=>g.addEventListener("click",ev=>{ev.stopPropagation();onFigClick(g.getAttribute("data-node"));}));
+}
+
+// ---- Fig. 9 : simplified constraint network (bipartite) ----------------------
+const CNG = {vColW:100, leftPad:64, rightPad:60, topPad:46, varR:18, levelH:44, band:72, botPad:46};
+function cnetKeep(sel){
+  if(!sel) return null;
+  const keep=new Set([sel]);
+  const con=SKELETON.cnet.constraints.find(k=>k.id===sel);
+  if(con){ con.vars.forEach(id=>keep.add(id)); }
+  else { SKELETON.cnet.constraints.forEach(k=>{ if(k.vars.indexOf(sel)>=0) keep.add(k.id); }); }
+  return keep;
+}
+function renderConstraintNet(){
+  const S=SKELETON, wrap=document.getElementById("constraintnet");
+  if(!S||!S.ok||!S.cnet){ wrap.innerHTML='<div style="padding:26px;color:#6b7280">Constraint-network view unavailable.</div>'; return; }
+  const vars=S.cnet.vars, cons=S.cnet.constraints, vIdx={}; vars.forEach((v,i)=>vIdx[v.id]=i);
+  const vx=i=>CNG.leftPad+i*CNG.vColW, conW=t=>Math.max(46,conShort(t).length*6.2+16);
+  const items=cons.map(k=>{ const xs=k.vars.map(id=>vx(vIdx[id])); return {k,x:xs.reduce((a,b)=>a+b,0)/xs.length,w:conW(k.ctype)}; }).sort((a,b)=>a.x-b.x);
+  const rowsA=[],rowsB=[]; let flip=false;
+  const pack=(arr,x0,x1)=>{ for(let r=0;r<arr.length;r++){ if(x0>=arr[r]+8){arr[r]=x1;return r;} } arr.push(x1); return arr.length-1; };
+  items.forEach(it=>{ flip=!flip; it.above=flip; it.lvl=pack(flip?rowsA:rowsB,it.x-it.w/2,it.x+it.w/2); });
+  const nA=Math.max(1,rowsA.length), nB=Math.max(1,rowsB.length);
+  const centerY=CNG.topPad+(nA-1)*CNG.levelH+CNG.band;
+  const W=CNG.leftPad+(vars.length-1)*CNG.vColW+CNG.rightPad, H=centerY+CNG.band+(nB-1)*CNG.levelH+CNG.botPad;
+  const conPos={}; items.forEach(it=>{ it.y=it.above?centerY-CNG.band-it.lvl*CNG.levelH:centerY+CNG.band+it.lvl*CNG.levelH; conPos[it.k.id]={x:it.x,y:it.y,w:it.w}; });
+  const rem=removableOn, keep=rem?null:cnetKeep(figSelected), dim=id=>keep&&!keep.has(id)?0.12:1;
+  let out=`<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" font-family="Inter,system-ui,sans-serif">`;
+  cons.forEach(k=>{ const cp=conPos[k.id]; k.vars.forEach(id=>{ const p={x:vx(vIdx[id]),y:centerY};
+     const op=rem?0.18:(keep?((keep.has(k.id)&&keep.has(id))?0.9:0.06):0.7);
+     out+=`<line x1="${cp.x}" y1="${cp.y}" x2="${p.x}" y2="${p.y}" stroke="#9aa3af" stroke-width="1" opacity="${op}"/>`; }); });
+  vars.forEach((v,i)=>{ const isVar=v.kind==="var";
+     out+=`<g class="fig-node" data-node="${v.id}" opacity="${rem?0.28:dim(v.id)}">`
+        +`<circle cx="${vx(i)}" cy="${centerY}" r="${CNG.varR}" fill="${v.color}" stroke="${isVar?"#2b2f36":"#b0b6be"}" stroke-width="1.5"/>`
+        +`<text x="${vx(i)}" y="${centerY+4}" text-anchor="middle" font-size="12.5" font-weight="600" fill="${isVar?"#14212c":"#5a6068"}">${esc(v.label)}</text>`
+        +`<title>${esc(v.label)}</title></g>`; });
+  items.forEach(it=>{ const k=it.k,cp=conPos[k.id],w=cp.w,h=22,x=cp.x-w/2,y=cp.y-h/2; let fill="#fff",stroke="#3a3f47",sw=1.3,op=1;
+     if(rem){ const st=REMSVG[k.removable||"structural"]||REMSVG.structural; fill=st.bg; stroke=st.b; sw=2.1; } else op=dim(k.id);
+     out+=`<g class="fig-con" data-node="${k.id}" opacity="${op}">`
+        +`<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="4" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>`
+        +`<text x="${cp.x}" y="${cp.y+3.5}" text-anchor="middle" font-size="10.5" fill="#33383f">${esc(conShort(k.ctype))}</text>`
+        +`<title>${esc(k.ctype)}</title></g>`; });
+  out+=`</svg>`;
+  wrap.innerHTML=out; figNatural.cnet=[W,H]; applyFigScale("cnet");
+  wrap.querySelectorAll("[data-node]").forEach(g=>g.addEventListener("click",ev=>{ev.stopPropagation();onFigClick(g.getAttribute("data-node"));}));
+}
+
+function renderCurrentFigure(){ if(viewMode==="skeleton") renderSkeleton(); else if(viewMode==="cnet") renderConstraintNet(); }
+
+// ---- shared figure helpers: zoom / fit / click / details ---------------------
+function applyFigScale(vk){
+  const wrap=document.getElementById(vk==="skeleton"?"skeleton":"constraintnet");
+  const svg=wrap.querySelector("svg"); if(!svg) return;
+  const W=figNatural[vk][0], H=figNatural[vk][1];
+  // Default to a readable 1:1 scale so a wide diagram OVERFLOWS the pane and can be
+  // scrolled; use "Fit" to shrink-to-width for an overview.
+  if(!figScale[vk]) figScale[vk]=1;
+  svg.setAttribute("width", W*figScale[vk]); svg.setAttribute("height", H*figScale[vk]);
+}
+function fitFigure(){
+  const vk = viewMode==="skeleton"?"skeleton":"cnet";
+  const wrap=document.getElementById(viewMode==="skeleton"?"skeleton":"constraintnet");
+  const W=figNatural[vk][0]||1, cw=wrap.clientWidth||900;
+  figScale[vk]=Math.min(1.4,Math.max(0.2,(cw-28)/W)); applyFigScale(vk); wrap.scrollTo({left:0,top:0});
+}
+["skeleton","constraintnet"].forEach(cid=>{
+  const wrap=document.getElementById(cid), vk=cid==="skeleton"?"skeleton":"cnet";
+  wrap.addEventListener("wheel",ev=>{
+    if(ev.ctrlKey||ev.metaKey){ ev.preventDefault();                       // Ctrl/Cmd+wheel = zoom
+      const cur=figScale[vk]||1; figScale[vk]=Math.min(2.4,Math.max(0.2,cur*(ev.deltaY<0?1.1:0.9))); applyFigScale(vk); return; }
+    // A wide-but-short figure only overflows horizontally; map plain vertical wheel to
+    // horizontal scroll so the wheel actually moves it (Shift+wheel / trackpad still work too).
+    const canY=wrap.scrollHeight-wrap.clientHeight>1, canX=wrap.scrollWidth-wrap.clientWidth>1;
+    if(!canY && canX && ev.deltaY!==0 && Math.abs(ev.deltaY)>=Math.abs(ev.deltaX)){ wrap.scrollLeft+=ev.deltaY; ev.preventDefault(); }
+  },{passive:false});
+  // Drag-to-pan (grab-scroll) like the interactive Factor-graph view. A <4px move stays a click, so
+  // node/factor selection is unaffected. NB: capture the pointer only AFTER a drag starts -- capturing on
+  // pointerdown retargets the follow-up click to the pane and breaks node/edge selection.
+  let panning=false, moved=false, px=0, py=0, sl=0, st=0, pid=null;
+  wrap.style.cursor="grab";
+  wrap.addEventListener("pointerdown",ev=>{
+    if(ev.button!==0) return;
+    panning=true; moved=false; px=ev.clientX; py=ev.clientY; sl=wrap.scrollLeft; st=wrap.scrollTop; pid=ev.pointerId;
+  });
+  wrap.addEventListener("pointermove",ev=>{
+    if(!panning) return;
+    const dx=ev.clientX-px, dy=ev.clientY-py;
+    if(!moved){ if(Math.hypot(dx,dy)<4) return; moved=true; wrap.style.cursor="grabbing"; try{wrap.setPointerCapture(pid);}catch(e){} }
+    wrap.scrollLeft=sl-dx; wrap.scrollTop=st-dy;
+  });
+  const endPan=()=>{ if(!panning) return; panning=false; wrap.style.cursor="grab"; try{wrap.releasePointerCapture(pid);}catch(e){} };
+  wrap.addEventListener("pointerup",endPan);
+  wrap.addEventListener("pointercancel",endPan);
+  wrap.addEventListener("click",ev=>{ if(moved){ ev.stopPropagation(); ev.preventDefault(); moved=false; } },true);
+  wrap.addEventListener("click",()=>{ if(figSelected && !removableOn){ figSelected=null; renderCurrentFigure(); clearDetails(); } });
+});
+function showFigCell(cell){
+  let meaning="";
+  if(typeof cell.value==="string" && cell.value.indexOf("__init__::")===0) meaning="initial pose of "+esc(figShort(cell.value.split("::").pop()));
+  else if(cell.value===null||cell.value===undefined) meaning="empty hand (not holding anything)";
+  const swatch = cell.color==="#d3d7dd" ? "#9aa0a6" : cell.color;
+  let html=`<div class="dtitle"><span class="chip" style="background:${swatch}">state var</span><span class="name">${esc(cell.label)}</span></div><table class="kv">`;
+  if(cell.row!==undefined) html+=row("row",esc(cell.row));
+  if(cell.col!==undefined) html+=row("state","s"+cell.col);
+  html+=row("kind", cell.kind==="const"?"constant (given)":"free variable");
+  if(meaning) html+=row("meaning",meaning);
+  document.getElementById("details").innerHTML=html+`</table>`;
+}
+function onFigClick(id){
+  const con=nodeById[id];
+  const showFor=()=>{
+    if(con && (con.kind==="constraint"||con.kind==="cost")) showNode(con);
+    else { const pool=[].concat(SKELETON.cells||[], SKELETON.motionCells||[], (SKELETON.cnet?SKELETON.cnet.vars:[]));
+           const cell=pool.find(c=>c.id===id);
+           if(cell && cell.var && nodeById[cell.var]) showNode(nodeById[cell.var]);
+           else if(cell) showFigCell(cell); }
+    switchTab("details");
+  };
+  if(removableOn){ showFor(); return; }
+  figSelected=(figSelected===id)?null:id;
+  if(figSelected) showFor(); else clearDetails();
+  renderCurrentFigure();
+}
+
+// ---- legends + view switching ------------------------------------------------
+function updateFigLegend(mode){
+  const el=document.getElementById("figlegend");
+  let h=`<div class="fl-title">${mode==="skeleton"?"Plan skeleton · Fig. 8":"Constraint network · Fig. 9"}</div>`;
+  h+=`<div class="fl-row"><span class="fl-dot"></span>free variable (parameter)</div>`;
+  h+=`<div class="fl-row"><span class="fl-dot const"></span>constant / given</div>`;
+  h+=`<div class="fl-row"><span class="fl-rect"></span>constraint (hard factor)</div>`;
+  if(mode==="skeleton") h+=`<div class="fl-row"><span class="fl-eq"></span>equality — value persists across steps</div>`;
+  h+=`<div class="fl-note">Colored circles are the free parameters cuTAMP must assign; grey are constants. Click a node for details; toggle <b>Removable</b> to see which constraints move the data distribution.</div>`;
+  el.innerHTML=h;
+}
+function refreshLegends(){
+  const isFG=viewMode==="factorgraph";
+  document.getElementById("remlegend").style.display = removableOn?"block":"none";
+  document.getElementById("figlegend").style.display = (!isFG && !removableOn)?"block":"none";
+}
+function setHintFor(mode){
+  const h=document.getElementById("hintbar");
+  if(mode==="skeleton") h.innerHTML="<b>Plan skeleton (Fig. 8)</b> — columns are states s0…sₖ · rows are state variables · rectangles are constraints between adjacent states · thick black lines are equality (a variable held across steps) · click any node/factor for details · drag to pan · Ctrl+scroll to zoom";
+  else if(mode==="cnet") h.innerHTML="<b>Simplified constraint network (Fig. 9)</b> — round nodes are the free parameters, rectangles are constraints, edges show each constraint's scope (constants &amp; objects removed) · click for details · drag to pan · Ctrl+scroll to zoom";
+  else h.innerHTML="Click a node or edge for details · drag to rearrange · scroll to zoom · use Legend&nbsp;&amp;&nbsp;filters to declutter";
+}
+function setView(mode){
+  viewMode=mode; figSelected=null;
+  document.querySelectorAll("#viewSeg button").forEach(b=>b.classList.toggle("on",b.dataset.view===mode));
+  const isFG=mode==="factorgraph";
+  document.getElementById("skeleton").classList.toggle("on",mode==="skeleton");
+  document.getElementById("constraintnet").classList.toggle("on",mode==="cnet");
+  document.getElementById("layoutSeg").style.display=isFG?"":"none";
+  document.getElementById("search").style.display=isFG?"":"none";
+  document.getElementById("btn-physics").hidden=!(isFG&&layoutMode==="force");
+  updateFigLegend(mode==="cnet"?"cnet":"skeleton"); setHintFor(mode); clearDetails();
+  if(mode==="skeleton") renderSkeleton();
+  else if(mode==="cnet") renderConstraintNet();
+  else { network.redraw(); network.fit({animation:false}); }
+  if(isFG) setRemovableMode(removableOn);   // keep vis coloring in sync with the shared toggle
+  refreshLegends();
+}
+document.querySelectorAll("#viewSeg button").forEach(b=>b.onclick=()=>{ if(b.dataset.view!==viewMode) setView(b.dataset.view); });
+
+// ---- view-aware toolbar (override the factor-graph-only handlers) ------------
+document.getElementById("btn-fit").onclick=()=>{ if(viewMode==="factorgraph") network.fit({animation:true}); else fitFigure(); };
+document.getElementById("btn-reset").onclick=()=>{
+  if(viewMode==="factorgraph"){ network.unselectAll(); if(removableOn){ removableOn=false; setRemovableMode(false); } setHighlight(null); }
+  else { removableOn=false; figSelected=null; renderCurrentFigure(); }
+  document.getElementById("btn-removable").classList.remove("on"); refreshLegends(); clearDetails();
+};
+document.getElementById("btn-removable").onclick=()=>{
+  removableOn=!removableOn;
+  if(viewMode==="factorgraph"){ if(removableOn){ network.unselectAll(); setHighlight(null); } setRemovableMode(removableOn); }
+  else { figSelected=null; renderCurrentFigure(); }
+  document.getElementById("btn-removable").classList.toggle("on",removableOn); refreshLegends();
+};
+window.addEventListener("resize",()=>{ if(viewMode!=="factorgraph") applyFigScale(viewMode==="skeleton"?"skeleton":"cnet"); });
+
+network.once("afterDrawing",()=>{ if(viewMode==="factorgraph") network.fit(); });
+setView(SKELETON && SKELETON.ok ? "skeleton" : "factorgraph");
 </script>
 </body>
 </html>
@@ -1248,6 +1811,7 @@ def plan_graph_to_html(graph: dict, inline_vis: Optional[Union[str, Path]] = Non
 
     graph_json = _script_safe(json.dumps(graph, default=str))
     docs_json = _script_safe(json.dumps(PLAN_DOCS))
+    skeleton_json = _script_safe(json.dumps(build_skeleton_layout(graph), default=str))
     raw_name = str(graph.get("name", "TAMP plan"))
     title = raw_name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") + " — plan graph"
 
@@ -1263,6 +1827,7 @@ def plan_graph_to_html(graph: dict, inline_vis: Optional[Union[str, Path]] = Non
         _HTML_TEMPLATE.replace("__VIS_SCRIPT__", vis_script)
         .replace("__GRAPH_JSON__", graph_json)
         .replace("__DOCS_JSON__", docs_json)
+        .replace("__SKELETON_JSON__", skeleton_json)
         .replace("__TITLE__", title)
     )
 
