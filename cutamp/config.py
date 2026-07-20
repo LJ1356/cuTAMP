@@ -57,6 +57,12 @@ class TAMPConfiguration:
     optimize_soft_costs: bool = False
     # Supported: dist_from_origin, max_obj_dist, min_obj_dist, min_y, max_y, align_yaw
     soft_cost: Optional[str] = None
+    # Enable the GraspCost soft cost: geodesic angle between each grasp's end-effector orientation and
+    # the robot's initial EE orientation (FK of q_init), steering the planner toward grasps that
+    # reorient the wrist least. Gated here (default off) because the cost reducer treats an ABSENT
+    # multiplier as weight 1.0, so an always-emitted value would change every caller's objective; the
+    # weight is set separately via constraint_to_mult[GraspCost.type]["grasp_rot_change"].
+    grasp_orientation_cost: bool = False
 
     ## Task Planning and subgraph caching
     # Number of initial plans to sample
@@ -86,6 +92,11 @@ class TAMPConfiguration:
     movable_activation_distance: float = 0.0
 
     ## Trajectories and cuRobo
+    # Norm p used for the per-move joint-space distance ||q_start - q_end||_p in the TrajectoryLength
+    # cost (see cutamp/costs.py::trajectory_length). 2.0 is the Euclidean straight-line distance;
+    # float("inf") is the max joint displacement (the infinity-norm). Both lower-bound the shortest
+    # collision-free path length between the two configurations.
+    traj_length_norm: float = 2.0
     # Whether to also optimize full trajectories (not supported right now)
     enable_traj: bool = False
     # Motion plan with cuRobo after optimization
@@ -159,6 +170,10 @@ def validate_tamp_config(config: TAMPConfiguration):
         raise ValueError(f"world_activation_distance must be non-negative, not {config.world_activation_distance}")
     if config.movable_activation_distance < 0:
         raise ValueError(f"movable_activation_distance must be non-negative, not {config.movable_activation_distance}")
+
+    # Trajectory length norm (torch.norm requires p >= 1; inf is allowed for the max-norm)
+    if config.traj_length_norm < 1:
+        raise ValueError(f"traj_length_norm must be >= 1 (or inf), not {config.traj_length_norm}")
 
     # Motion refinement
     if config.max_motion_refine_attempts is not None and config.max_motion_refine_attempts <= 0:

@@ -58,6 +58,31 @@ class ParticleOptimizer:
         self.types_to_optimize = {Pose, Conf}
         self.opt_counter = 0
 
+    def _cost_breakdown(self, cost_dict: dict, idx: int) -> dict:
+        """Per-term cost values for a single particle, for logging.
+
+        Mirrors CostReducer.get_cost so recorded numbers match the objective: each entry sums over the
+        time dimension and reports raw value, the applied weight (an ABSENT multiplier is 1.0, as in the
+        reducer), and their product. ``kind`` is "cost" (soft) or "constraint" (hard). Keyed
+        "<CostType>/<name>", e.g. "GraspCost/grasp_rot_change", "TrajectoryLength/traj_length".
+        """
+        breakdown = {}
+        for cost_type, entry in cost_dict.items():
+            for name, values in entry["values"].items():
+                v = values[idx]
+                if v.ndim >= 1:
+                    v = v.sum()  # sum over time, matching the reducer
+                raw = v.item()
+                mult = self.cost_reducer.cost_to_multiplier.get((cost_type, name))
+                weight = 1.0 if mult is None else float(mult)
+                breakdown[f"{cost_type}/{name}"] = {
+                    "raw": raw,
+                    "weight": weight,
+                    "weighted": raw * weight,
+                    "kind": entry["type"],
+                }
+        return breakdown
+
     def __call__(self, plan_info: PlanContainer, timer: TorchTimer, visualizer: Visualizer) -> Tuple[bool, dict, bool]:
         """
         Optimize the particles for the given plan skeleton in the plan_info container.
@@ -253,6 +278,19 @@ class ParticleOptimizer:
             best_idx = indices[satisfying_mask][best_satisfying_idx]
         else:
             best_idx = costs.argmin()
+
+        # Per-term cost breakdown for the chosen particle. Stored in opt_metrics so it is persisted by
+        # exp_logger.log_dict (-> <exp_dir>/optimization/opt_XXXX.json), attributing best_cost to the
+        # individual terms (e.g. GraspCost/grasp_rot_change) for tuning. Also logged for quick eyeballing.
+        best_breakdown = self._cost_breakdown(cost_dict, best_idx)
+        opt_metrics["best_cost_breakdown"] = best_breakdown
+        _log.info(
+            "[Opt best] weighted cost breakdown: "
+            + ", ".join(
+                f"{name}={term['weighted']:.4g}"
+                for name, term in sorted(best_breakdown.items(), key=lambda kv: -kv[1]["weighted"])
+            )
+        )
 
         # Log initial state
         timer.start("visualize_rollout")

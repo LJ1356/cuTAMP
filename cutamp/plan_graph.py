@@ -261,9 +261,10 @@ COST_DOCS = {
         ],
     },
     "GraspCost": {
-        "summary": "Soft cost scoring grasp quality.",
-        "detail": "Scores how preferred the grasp on obj is. Note: in this fork it is informational — the "
-        "differentiable cost function warns that GraspCost is not currently evaluated.",
+        "summary": "Soft cost: end-effector orientation change to reach the grasp.",
+        "detail": "Geodesic angle between the grasp's end-effector orientation and the robot's initial EE "
+        "orientation (FK of q_init); minimized to prefer grasps that reorient the wrist least. Opt-in: only "
+        "reduced when a GraspCost multiplier is set, otherwise the computed value is dropped.",
         "params": [
             ["obj", "The object being grasped."],
             ["grasp", "The grasp pose being scored."],
@@ -313,9 +314,10 @@ CONSTRAINT_REMOVABILITY = {
     "TrajectoryLength": {"tier": "structural", "label": "structural — keep",
         "effect": "Soft cost, but removing it breaks rollout validation (its confs must equal the rollout's). "
         "To stop shaping toward short paths, set its multiplier to 0 rather than removing it."},
-    "GraspCost": {"tier": "noop", "label": "no-op to remove",
-        "effect": "Already not evaluated by the differentiable cost function in this fork (a warning is "
-        "emitted), so removing it changes nothing."},
+    "GraspCost": {"tier": "free", "label": "removable",
+        "effect": "Soft cost charging the EE orientation change to reach the grasp. Removing it (or setting "
+        "its multiplier to 0) stops shaping toward grasps that reorient the wrist least; feasibility is "
+        "unaffected."},
 }
 
 PLAN_DOCS = {

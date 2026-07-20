@@ -16,11 +16,18 @@ from cutamp.costs_warp import sphere_to_sphere_overlap_warp
 
 
 def trajectory_length(
-    confs: Float[torch.Tensor, "b *h d"], weights: Optional[Float[torch.Tensor, "d"]] = None
+    confs: Float[torch.Tensor, "b *h d"],
+    weights: Optional[Float[torch.Tensor, "d"]] = None,
+    p: float = 2.0,
 ) -> Float[torch.Tensor, "b"]:
     """
     Compute the length of a trajectory by summing the distances between consecutive configurations.
     Optionally apply per-dimension weights before computing distances.
+
+    ``p`` selects the norm used for the per-step (per-``move``) configuration distance
+    ``||q_i - q_{i+1}||_p``: ``p=2`` (default) is the Euclidean straight-line distance, ``p=inf`` is
+    the max joint displacement. Both are lower bounds on the length of the shortest collision-free
+    path between the two configurations.
     """
     if weights is not None:
         assert weights.shape == (confs.shape[-1],), f"weights must be shape ({confs.shape[-1]},), got {weights.shape}"
@@ -28,7 +35,7 @@ def trajectory_length(
         confs = confs * weights
 
     diffs = confs[..., 1:, :] - confs[..., :-1, :]
-    dists = diffs.norm(dim=-1)
+    dists = diffs.norm(p=p, dim=-1)
     traj_lengths = dists.sum(-1)  # sum over horizon
     return traj_lengths
 

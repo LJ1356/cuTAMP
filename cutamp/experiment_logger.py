@@ -31,17 +31,21 @@ def _collect_git_info() -> dict:
             ["git", "rev-parse", "HEAD"],
             cwd=_GIT_CWD,
             stderr=subprocess.DEVNULL,
-            text=True,
+            # Force UTF-8 (not the locale codec, which is ASCII in the pixi env) so non-ASCII bytes in
+            # tracked files/filenames don't raise UnicodeDecodeError; replace anything undecodable.
+            encoding="utf-8",
+            errors="replace",
         ).strip()
         porcelain = subprocess.check_output(
             ["git", "status", "--porcelain"],
             cwd=_GIT_CWD,
             stderr=subprocess.DEVNULL,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         dirty = bool(porcelain.strip())
         return {"commit": commit, "dirty": dirty, "porcelain": porcelain.strip() if dirty else None}
-    except (FileNotFoundError, subprocess.CalledProcessError):
+    except (FileNotFoundError, subprocess.CalledProcessError, UnicodeDecodeError):
         _log.warning("Failed to collect git info", exc_info=True)
         return {"commit": None, "dirty": None, "porcelain": None}
 
@@ -53,10 +57,13 @@ def _get_git_diff() -> str | None:
             ["git", "diff", "HEAD"],
             cwd=_GIT_CWD,
             stderr=subprocess.DEVNULL,
-            text=True,
+            # UTF-8 (not the ASCII locale codec) with replacement: diffs routinely contain non-ASCII
+            # (e.g. em-dashes in comments/docstrings), which otherwise crashes the whole plan.
+            encoding="utf-8",
+            errors="replace",
         )
         return diff if diff else None
-    except (FileNotFoundError, subprocess.CalledProcessError):
+    except (FileNotFoundError, subprocess.CalledProcessError, UnicodeDecodeError):
         _log.warning("Failed to get git diff", exc_info=True)
         return None
 

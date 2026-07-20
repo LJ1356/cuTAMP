@@ -9,7 +9,6 @@
 
 import itertools
 import logging
-import warnings
 from collections import defaultdict
 from typing import Dict, Union
 
@@ -67,6 +66,7 @@ class CostFunction:
         self.valid_push_constraints = []
         self.valid_push_stick_constraints = []
         self.traj_length_costs = []
+        self.grasp_costs = []
 
         type_to_list = {
             KinematicConstraint.type: self.kinematic_constraints,
@@ -79,17 +79,26 @@ class CostFunction:
             ValidPush.type: self.valid_push_constraints,
             ValidPushStick.type: self.valid_push_stick_constraints,
             TrajectoryLength.type: self.traj_length_costs,
+            GraspCost.type: self.grasp_costs,
         }
-        warning_co = {GraspCost.type}
         for ground_op in plan_skeleton:
             for co in [*ground_op.constraints, *ground_op.costs]:
                 if co.type not in type_to_list:
-                    if co.type in warning_co:
-                        warnings.warn(f"Cost {co} is not handled in the cost function")
-                    else:
-                        raise NotImplementedError(f"Unhandled constraint or cost: {co}")
+                    raise NotImplementedError(f"Unhandled constraint or cost: {co}")
                 else:
                     type_to_list[co.type].append(co)
+
+        # GraspCost(obj, grasp): orientation-only "least change in EE pose" soft cost. Charges the
+        # geodesic angle between each grasp's end-effector orientation and the robot's INITIAL EE
+        # orientation (FK of world.q_init), so the planner prefers grasps that reorient the wrist
+        # least. grasp is the action param (params[1]); we index world_from_ee_desired at its
+        # timestep in grasp_orientation_costs. Only active when a multiplier is set (opt-in).
+        self.grasp_cost_action_names = [cost.params[1] for cost in self.grasp_costs]
+        self.init_ee_rotmat = None
+        if self.grasp_costs and self.config.grasp_orientation_cost:
+            q_init = self.world.q_init.view(1, -1)
+            init_ee_mat = self.world.kin_model.get_state(q_init).ee_pose.get_matrix()  # (1, 4, 4)
+            self.init_ee_rotmat = init_ee_mat[:, :3, :3].detach()  # (1, 3, 3), constant reference
 
         # All conf parameters for motion constraints, we check rollout is subset
         self.motion_conf_params = set(
@@ -447,9 +456,31 @@ class CostFunction:
         traj_cost = {
             "type": "cost",
             "costs": self.traj_length_costs,
-            "values": {"traj_length": trajectory_length(rollout["confs"])},
+            "values": {"traj_length": trajectory_length(rollout["confs"], p=self.config.traj_length_norm)},
         }
         return traj_cost
+
+    def grasp_orientation_costs(self, rollout: Rollout) -> Union[dict, None]:
+        """GraspCost - geodesic angle between each grasp's EE orientation and the initial EE orientation.
+
+        Incentivizes grasps that require the least change in end-effector orientation from the robot's
+        starting pose. Returns None unless the skeleton has grasps AND config.grasp_orientation_cost is
+        set (the gate: an absent reducer multiplier defaults to weight 1.0, so we must not emit this
+        value unless the caller opted in).
+        """
+        if not self.grasp_costs or not self.config.grasp_orientation_cost:
+            return None
+        # EE orientation desired at each grasp's timestep (same "ee" frame as kinematic_costs uses).
+        ts_idxs = [rollout["action_to_ts"][name] for name in self.grasp_cost_action_names]
+        grasp_rotmat = rollout["world_from_ee_desired"][:, ts_idxs, :3, :3]  # (b, k, 3, 3)
+        init_rotmat = self.init_ee_rotmat.view(1, 1, 3, 3).expand_as(grasp_rotmat)
+        # Geodesic distance on SO(3) in radians; roma clamps internally to keep gradients stable.
+        grasp_rot_change = roma.rotmat_geodesic_distance(grasp_rotmat, init_rotmat)  # (b, k)
+        return {
+            "type": "cost",
+            "costs": self.grasp_costs,
+            "values": {"grasp_rot_change": grasp_rot_change},
+        }
 
     def collision_costs(self, rollout: Rollout, obj_to_spheres: Dict[str, Float[torch.Tensor, "b t n 4"]]) -> dict:
         """Collision costs."""
@@ -584,6 +615,11 @@ class CostFunction:
         with torch.profiler.record_function("cost::trajectory"):
             traj_cost = self.trajectory_costs(rollout)
         add_cost(TrajectoryLength.type, traj_cost)
+
+        # Grasp orientation-change cost (opt-in; only reduced when a GraspCost multiplier is set)
+        with torch.profiler.record_function("cost::grasp_orientation"):
+            grasp_cost = self.grasp_orientation_costs(rollout)
+        add_cost(GraspCost.type, grasp_cost)
 
         # Get collision spheres for movable objects
         with torch.profiler.record_function("cost::transform_spheres"):
