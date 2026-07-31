@@ -9,6 +9,7 @@
 
 """Solving motions with cuRobo."""
 
+import contextlib
 import logging
 from typing import List, Optional
 
@@ -22,7 +23,10 @@ from curobo.types.state import JointState
 from curobo.wrap.reacher.motion_gen import MotionGenPlanConfig, MotionGen
 from cutamp.config import TAMPConfiguration
 from cutamp.optimize_plan import PlanContainer
-from cutamp.tamp_domain import MoveHolding, Push, PushStick, MoveFree, Place, Pick
+from cutamp.robots.bimanual_yam import YAM_FINGER_CLOSED, YAM_FINGER_OPEN
+from cutamp.tamp_domain import (Handover, MoveHolding, MoveHoldingBoth, MoveHoldingGiver,
+                                MoveHoldingTaker, Push, PushStick, MoveFree, Place, PlaceBoth,
+                                PlaceTaker, Pick, PickBoth, PickGiver)
 from cutamp.tamp_world import TAMPWorld
 from cutamp.utils.common import Particles, action_6dof_to_mat4x4, action_4dof_to_mat4x4
 from cutamp.utils.timer import TorchTimer
@@ -235,7 +239,10 @@ def solve_curobo(
             del obstacle.old_get_bounding_spheres
 
             # Close the gripper in the visualization
-            if config.robot == "ur5" or config.robot == "fr3_robotiq":
+            if config.robot.startswith("bimanual_yam_"):
+                # Two prismatic fingers, open at YAM_FINGER_OPEN (negative) and closed at 0.
+                interp = torch.linspace(YAM_FINGER_OPEN, YAM_FINGER_CLOSED, 20)[:, None].repeat(1, 2)
+            elif config.robot == "ur5" or config.robot == "fr3_robotiq":
                 end_val = 0.4
                 interp = torch.linspace(0.0, end_val, 20)
                 interp = interp[:, None]
@@ -367,7 +374,9 @@ def solve_curobo(
                 motion_gen.world_collision.update_obstacle_pose(obj, Pose.from_matrix(obj_pose))
 
             # Open the gripper for visualization purposes
-            if config.robot == "ur5" or config.robot == "fr3_robotiq":
+            if config.robot.startswith("bimanual_yam_"):
+                interp = torch.linspace(YAM_FINGER_CLOSED, YAM_FINGER_OPEN, 20)[:, None].repeat(1, 2)
+            elif config.robot == "ur5" or config.robot == "fr3_robotiq":
                 end_val = 0.0
                 interp = torch.linspace(0.4, end_val, 20)
                 interp = interp[:, None]
@@ -439,5 +448,384 @@ def solve_curobo(
     _ = visualizer.log_joint_trajectory(plan.position, timeline=timeline, start_time=ts, dt=dt)
     _log.debug("Planned to go home")
 
+    _log.info(f"Motion planning metrics: {timer.get_summary(f'{timeline}_planning')}")
+    return accum_plans
+
+
+def solve_curobo_dual(
+    plan_info: PlanContainer,
+    best_particle: Particles,
+    world: TAMPWorld,
+    config: TAMPConfiguration,
+    timer: TorchTimer,
+    visualizer: Visualizer,
+    obj_to_initial_pose: dict[str, torch.Tensor],
+    timeline: str = "curobo",
+    motion_gen: Optional[MotionGen] = None,
+):
+    """Motion-plan a LOCKSTEP dual-arm skeleton, where both hands act at the same timestep.
+
+    Kept separate from :func:`solve_curobo` rather than folded into it, because the two differ in the
+    one place that matters: ``solve_curobo`` drives every segment with ``plan_single`` against a
+    single ``ee_link`` pose target, which on a 12-DOF dual chain would constrain ONE hand and leave
+    the other arm's six joints floating in the null space. There is no cuRobo API for giving two
+    hands a pose target at once.
+
+    So this plans in CONFIGURATION space instead: cuTAMP has already optimized a full 12-DOF
+    configuration for each timestep, satisfying both hands' kinematic constraints simultaneously, so
+    ``plan_single_js`` between consecutive configurations is both sufficient and exactly right -- it
+    is the only cuRobo motion call that is DOF-agnostic and needs no pose target. The trade-off is
+    that a joint-space goal cannot express "approach along the tool's -z", so the cartesian
+    approach/retract segments of the single-arm solver have no counterpart here.
+
+    Gripper steps carry an ``"arm"`` key so the two hands can be actuated independently downstream;
+    a grasped object is attached to that arm's own ``<arm>_attached_object`` link.
+    """
+    plan_skeleton = plan_info["plan_skeleton"]
+    arms = world.arms
+    if not arms:
+        raise ValueError("solve_curobo_dual requires a multi-arm robot container")
+
+    if motion_gen is None:
+        motion_gen = world.get_motion_gen(collision_activation_distance=config.world_activation_distance)
+    if config.warmup_motion_gen:
+        with timer.time(f"{timeline}_motion_gen_warmup", log_callback=_log.debug):
+            motion_gen.warmup()
+
+    # Far more generous than the single-arm pose-target config. A joint-space goal over 12 DOF is a
+    # much longer motion than the single-arm solver's short cartesian hops (which chain
+    # retract -> approach -> grasp), so trajopt alone reliably fails on it; the graph planner finds a
+    # collision-free seed and finetuning cleans it up.
+    plan_config = MotionGenPlanConfig(
+        timeout=15.0,
+        enable_finetune_trajopt=True,
+        enable_graph=True,
+        enable_graph_attempt=1,
+        max_attempts=8,
+        time_dilation_factor=config.time_dilation_factor,
+    )
+
+    ts = 0.0
+    obj_to_current_pose = {k: v.clone() for k, v in obj_to_initial_pose.items()}
+
+    # Reset: clear BOTH hands' attachments and restore every object's pose.
+    for spec in arms:
+        motion_gen.detach_object_from_robot(spec.attached_link)
+    for obj, obj_pose in obj_to_current_pose.items():
+        motion_gen.world_coll_checker.enable_obstacle(enable=True, name=obj)
+        motion_gen.world_collision.update_obstacle_pose(obj, Pose.from_matrix(obj_pose))
+
+    visualizer.set_time_seconds(timeline, ts)
+    visualizer.set_joint_positions(best_particle["q0"])
+    for obj, pose in obj_to_current_pose.items():
+        visualizer.log_mat4x4(f"world/{obj}", pose)
+
+    last_js = JointState.from_position(best_particle["q0"][None].clone())
+    accum_plans = []
+
+    @contextlib.contextmanager
+    def temporarily_detached(specs):
+        """Hide the given hands' attached-object spheres from the collision model for one solve.
+
+        Nesting is safe: an inner block stashes whatever the outer one left (already-empty spheres)
+        and restores that, and the outer block restores the real ones.
+        """
+        kin_config = motion_gen.kinematics.kinematics_config
+        stashed = {}
+        for spec in specs:
+            try:
+                stashed[spec.attached_link] = kin_config.get_link_spheres(spec.attached_link).clone()
+                kin_config.detach_object(spec.attached_link)
+            except Exception:  # nothing attached to this hand
+                pass
+        try:
+            yield
+        finally:
+            for link_name, spheres in stashed.items():
+                kin_config.attach_object(sphere_tensor=spheres, link_name=link_name)
+
+    def plan_to(q_name, label: str):
+        """Joint-space segment from the current state to a configuration (name or tensor)."""
+        nonlocal last_js, ts
+        goal = q_name if torch.is_tensor(q_name) else best_particle[q_name]
+        goal_js = JointState.from_position(goal[None].clone())
+        with timer.time(f"{timeline}_planning"):
+            result = motion_gen.plan_single_js(last_js, goal_js, plan_config)
+        if (
+            not result.success
+            and result.status is not None
+            and result.status.name == "INVALID_START_STATE_WORLD_COLLISION"
+        ):
+            # Right after a grasp the held objects are attached bodies still resting on the table, so
+            # the start state reads as in-collision and nothing can be planned OUT of it. Detach the
+            # attached spheres for the duration of this solve and restore them after -- the same
+            # fallback solve_curobo uses for its cartesian retract, extended to every hand.
+            with temporarily_detached(arms), timer.time(f"{timeline}_planning"):
+                result = motion_gen.plan_single_js(last_js, goal_js, plan_config)
+        if not result.success:
+            name = "a lifted configuration" if torch.is_tensor(q_name) else q_name
+            raise MotionPlanningError(f"Failed to plan to {name} for {label}. Status: {result.status}")
+        plan = result.get_interpolated_plan()
+        accum_plans.append({
+            "type": "trajectory",
+            "plan": plan,
+            "dt": result.interpolation_dt,
+            "optimized_plan": result.optimized_plan,
+            "optimized_dt": result.optimized_dt,
+            "label": label,
+        })
+        last_js = JointState.from_position(plan[-1:].position)
+        ts = visualizer.log_joint_trajectory(
+            plan.position, timeline=timeline, start_time=ts, dt=result.interpolation_dt
+        )
+
+    def lift_configuration(q_name_or_tensor, dz: float = 0.10):
+        """A configuration with both hands raised ``dz`` in world z, via per-arm IK.
+
+        The joint-space counterpart of ``solve_curobo``'s cartesian retract, and just as necessary:
+        immediately after a grasp the held object is still sitting on the table, so once it becomes
+        an attached body every subsequent plan starts in world collision. ``plan_single_js`` cannot
+        express "move along the tool axis", so the lifted pose is turned back into a configuration by
+        solving each arm's IK for its own raised end-effector pose -- the same trick used to seed
+        dual-arm particles. Returns None if either arm's IK fails, letting the caller skip the lift.
+        """
+        q = q_name_or_tensor if torch.is_tensor(q_name_or_tensor) else best_particle[q_name_or_tensor]
+        state = world.kin_model.get_state(q.view(1, -1))
+        lifted = torch.zeros_like(q.view(1, -1))
+        for spec in arms:
+            world_from_ee = state.link_pose[spec.ee_link].get_matrix().clone()  # clone: cuRobo reuses buffers
+            world_from_ee[:, 2, 3] += dz
+            res = world.ik_solvers[spec.name].solve_batch(Pose.from_matrix(world_from_ee))
+            if not bool(res.success.flatten()[0]):
+                return None
+            lifted[:, spec.joint_slice] = res.solution[:, 0]
+        return lifted[0]
+
+    def back_off_configuration(q_name_or_tensor, specs, dist: float = 0.12):
+        """``q`` with the given arms' end-effectors pulled back ``dist`` along their own approach axes.
+
+        Serves both ends of a grasp. As a PRE-grasp it substitutes for the cartesian approach that
+        ``solve_curobo`` gets from ``plan_single`` and joint-space planning cannot express: without it
+        the hand may arrive at the grasp from any direction at all, and since the target object is
+        necessarily disabled as an obstacle for that segment, a long object gets swept aside instead of
+        gripped. As a RETRACT it withdraws the giver after a handover, whose open jaws still surround
+        an object that now belongs to the taker -- lifting both arms cannot fix that, since they would
+        rise together and stay overlapped.
+
+        A shorter stand-off is tried when the full one is unreachable -- a mid-air handover pose sits
+        near the edge of both arms' workspaces, where 12 cm back along the approach axis is often
+        outside it while 4 cm is not, and a short approach is still far better than none. Returns None
+        only if every distance fails, letting the caller fall back to planning straight to ``q``.
+        """
+        q0 = (q_name_or_tensor if torch.is_tensor(q_name_or_tensor) else best_particle[q_name_or_tensor])
+        for scale in (1.0, 0.6, 0.35):
+            q = q0.view(1, -1).clone()
+            state = world.kin_model.get_state(q)
+            ee_from_back = torch.eye(4, device=q.device, dtype=q.dtype)[None].clone()
+            ee_from_back[:, 2, 3] = -dist * scale
+            ok = True
+            for spec in specs:
+                world_from_ee = state.link_pose[spec.ee_link].get_matrix().clone()  # buffers are reused
+                res = world.ik_solvers[spec.name].solve_batch(
+                    Pose.from_matrix(world_from_ee @ ee_from_back)
+                )
+                if not bool(res.success.flatten()[0]):
+                    ok = False
+                    break
+                q[:, spec.joint_slice] = res.solution[:, 0]
+            if ok:
+                return q[0]
+        return None
+
+    def approach_and_plan_to(q_name, specs, label: str, disable: tuple = (), dist: float = 0.10):
+        """Plan to ``q_name`` via a pre-grasp waypoint, with ``disable``d obstacles only on the last hop.
+
+        The objects being grasped (or the surface being placed on) have to be disabled to reach a
+        configuration that is in contact with them by construction -- but disabling them for the WHOLE
+        segment lets the arm travel through them. Splitting the segment confines that blindness to a
+        short straight-in descent, while the long transit still sees every obstacle.
+        """
+        pre = back_off_configuration(q_name, specs, dist)
+        if pre is not None:
+            plan_to(pre, f"Approach({label})")
+        for name in disable:
+            motion_gen.world_coll_checker.enable_obstacle(enable=False, name=name)
+        try:
+            plan_to(q_name, label)
+        finally:
+            for name in disable:
+                motion_gen.world_coll_checker.enable_obstacle(enable=True, name=name)
+
+    def attach(obj: str, spec):
+        """Attach one object to one hand, using cuTAMP's sampled spheres for that object."""
+        obstacle = motion_gen.world_model.get_obstacle(obj)
+        obstacle.old_get_bounding_spheres = obstacle.get_bounding_spheres
+
+        def get_bounding_spheres(self, *args, **kwargs) -> List[Sphere]:
+            spheres = world.get_collision_spheres(obj)
+            pts = spheres[:, :3].cpu().numpy()
+            n_radius = spheres[:, 3].cpu().numpy()
+            obj_pose = Pose.from_matrix(obj_to_current_pose[obj])
+            pre_transform_pose = kwargs["pre_transform_pose"]
+            if pre_transform_pose is not None:
+                obj_pose = pre_transform_pose.multiply(obj_pose)
+            points_cuda = self.tensor_args.to_device(pts)
+            pts = obj_pose.transform_points(points_cuda).cpu().view(-1, 3).numpy()
+            return [
+                Sphere(name=f"{self.name}_sph_{i}",
+                       pose=[pts[i, 0], pts[i, 1], pts[i, 2], 1, 0, 0, 0], radius=n_radius[i])
+                for i in range(pts.shape[0])
+            ]
+
+        obstacle.get_bounding_spheres = get_bounding_spheres.__get__(obstacle)
+        with timer.time(f"{timeline}_planning"):
+            motion_gen.attach_objects_to_robot(
+                last_js,
+                object_names=[obj],
+                link_name=spec.attached_link,
+                surface_sphere_radius=0.005,
+                sphere_fit_type=SphereFitType.VOXEL_VOLUME_SAMPLE_SURFACE,
+                voxelize_method="subdivide",
+            )
+        obstacle.get_bounding_spheres = obstacle.old_get_bounding_spheres
+        del obstacle.old_get_bounding_spheres
+
+    def gripper_step(action: str, specs, label: str):
+        """One gripper event for one OR MORE hands.
+
+        ``specs`` is a list because a lockstep operator means the hands act at the same instant:
+        ``PickBoth`` is one closure of two jaws, not two closures that happen to be adjacent. Emitting
+        it as a single step is what lets a consumer actuate them together -- two consecutive per-hand
+        steps are indistinguishable from a deliberate sequence, which is exactly what ``Handover``
+        needs (its taker must close BEFORE its giver opens, or the object is unsupported), so the two
+        cases have to be distinguishable in the plan itself rather than by a downstream heuristic.
+
+        ``arm`` is kept alongside ``arms`` for the single-hand case so existing consumers still read.
+        """
+        if not isinstance(specs, (list, tuple)):
+            specs = [specs]
+        step = {"type": "gripper", "action": action, "arms": [s.name for s in specs], "label": label}
+        if len(specs) == 1:
+            step["arm"] = specs[0].name
+        accum_plans.append(step)
+
+    for idx, ground_op in enumerate(plan_skeleton):
+        op_name = ground_op.operator.name
+        _log.info(f"{idx + 1}. {ground_op.name}")
+
+        # The Move operators only name the configuration the next action lands on; planning is done
+        # by that action, exactly as in solve_curobo.
+        if op_name in (MoveFree.name, MoveHoldingBoth.name,
+                       MoveHoldingGiver.name, MoveHoldingTaker.name):
+            continue
+
+        elif op_name == PickBoth.name:
+            obj_a, grasp_a, obj_b, grasp_b, q = ground_op.values
+            # The grasp configuration is, by construction, in contact with the objects being
+            # grasped: cuTAMP has already checked the gripper against them using their sampled
+            # surface spheres, but cuRobo's world model treats them as SOLID obstacles, so leaving
+            # them enabled makes the grasp itself read as a collision and motion planning into it
+            # can never succeed. Disable exactly the two targets, and only for the final descent from
+            # the pre-grasp; they come back as attached bodies immediately afterwards, and every other
+            # object stays an obstacle throughout.
+            approach_and_plan_to(q, arms, ground_op.name, disable=(obj_a, obj_b))
+            # ONE closure of both jaws -- see gripper_step. The attachments are planner-side only, so
+            # doing them after the event does not change what executes.
+            gripper_step("close", arms, ground_op.name)
+            for spec, obj in zip(arms, (obj_a, obj_b)):
+                attach(obj, spec)
+                motion_gen.world_coll_checker.enable_obstacle(enable=False, name=obj)
+            # Lift before moving: the objects are now attached bodies still resting on the table.
+            lifted = lift_configuration(q)
+            if lifted is not None:
+                plan_to(lifted, f"Retract({ground_op.name})")
+
+        elif op_name == PlaceBoth.name:
+            obj_a, grasp_a, place_a, surf_a, obj_b, grasp_b, place_b, surf_b, q = ground_op.values
+            plan_to(q, ground_op.name)
+            gripper_step("open", arms, ground_op.name)  # both jaws release together
+            for spec, obj, placement in zip(arms, (obj_a, obj_b), (place_a, place_b)):
+                motion_gen.detach_object_from_robot(spec.attached_link)
+                # The object simply IS at its optimized placement now, so unlike solve_curobo there
+                # is no need to recover its pose through the end-effector transform.
+                obj_to_current_pose[obj] = action_4dof_to_mat4x4(best_particle[placement][None].clone())[0]
+                motion_gen.world_coll_checker.enable_obstacle(enable=True, name=obj)
+                motion_gen.world_collision.update_obstacle_pose(
+                    obj, Pose.from_matrix(obj_to_current_pose[obj])
+                )
+                visualizer.log_mat4x4(f"world/{obj}", obj_to_current_pose[obj])
+            # Lift clear of the objects just released before heading home.
+            lifted = lift_configuration(q)
+            if lifted is not None:
+                plan_to(lifted, f"Retract({ground_op.name})")
+
+        elif op_name == PickGiver.name:
+            obj, grasp, q = ground_op.values
+            giver = arms[0]
+            approach_and_plan_to(q, [giver], ground_op.name, disable=(obj,))
+            gripper_step("close", giver, ground_op.name)
+            attach(obj, giver)
+            motion_gen.world_coll_checker.enable_obstacle(enable=False, name=obj)
+            lifted = lift_configuration(q)
+            if lifted is not None:
+                plan_to(lifted, f"Retract({ground_op.name})")
+
+        elif op_name == Handover.name:
+            obj, grasp_g, grasp_t, hand_pose, q = ground_op.values
+            giver, taker = arms[0], arms[1]
+            # The taker has to drive its jaws ONTO the object, which is an attached body on the giver
+            # -- so to cuRobo the approach is a self-collision and no trajectory exists. cuTAMP has
+            # already checked this configuration's gripper-vs-object clearance under its own sphere
+            # model (CollisionFreeGrasp), so the attachment is hidden for this one solve, exactly as
+            # the world obstacle is hidden for the pick.
+            # The pre-grasp hop still sees the object on the giver's hand, so the taker cannot swipe
+            # through it on the way in; only the short descent is blind to it.
+            pre = back_off_configuration(q, [taker])
+            if pre is not None:
+                plan_to(pre, f"Approach({ground_op.name})")
+            with temporarily_detached([giver]):
+                plan_to(q, ground_op.name)
+            # Both hands hold the object for an instant: the taker closes first, THEN the giver
+            # releases, so the object is never unsupported. cuRobo can only model it as attached to
+            # one link, so the handoff is a detach/attach pair between the two hands.
+            gripper_step("close", taker, ground_op.name)
+            obj_to_current_pose[obj] = action_4dof_to_mat4x4(best_particle[hand_pose][None].clone())[0]
+            motion_gen.world_collision.update_obstacle_pose(obj, Pose.from_matrix(obj_to_current_pose[obj]))
+            motion_gen.detach_object_from_robot(giver.attached_link)
+            attach(obj, taker)
+            gripper_step("open", giver, ground_op.name)
+            visualizer.log_mat4x4(f"world/{obj}", obj_to_current_pose[obj])
+            # Withdraw the giver before the taker carries the object anywhere, or every later segment
+            # starts with the giver's fingers inside the taker's attached object.
+            backed = back_off_configuration(q, [giver])
+            if backed is not None:
+                with temporarily_detached([taker]):
+                    plan_to(backed, f"Retract({ground_op.name})")
+
+        elif op_name == PlaceTaker.name:
+            obj, grasp, placement, surface, q = ground_op.values
+            taker = arms[1]
+            # A placement RESTS ON the surface, so the held object's spheres touch the tray -- solid to
+            # cuRobo, in contact by construction to cuTAMP, which already checked the placement is
+            # stable and collision-free. Same treatment as the grasp target at pick time: the surface
+            # is disabled for this one segment.
+            approach_and_plan_to(q, [taker], ground_op.name, disable=(surface,))
+            gripper_step("open", taker, ground_op.name)
+            motion_gen.detach_object_from_robot(taker.attached_link)
+            obj_to_current_pose[obj] = action_4dof_to_mat4x4(best_particle[placement][None].clone())[0]
+            motion_gen.world_collision.update_obstacle_pose(obj, Pose.from_matrix(obj_to_current_pose[obj]))
+            visualizer.log_mat4x4(f"world/{obj}", obj_to_current_pose[obj])
+            # The jaws are still around the object, so it stays disabled until the arm has withdrawn;
+            # re-enabling it first makes the retract's own start state read as a world collision.
+            lifted = lift_configuration(q)
+            if lifted is not None:
+                plan_to(lifted, f"Retract({ground_op.name})")
+            motion_gen.world_coll_checker.enable_obstacle(enable=True, name=obj)
+
+        else:
+            raise NotImplementedError(f"Unsupported operator for dual-arm motion planning: {op_name}")
+
+    # Return home
+    plan_to("q0", "GoToInitial(q0)")
     _log.info(f"Motion planning metrics: {timer.get_summary(f'{timeline}_planning')}")
     return accum_plans

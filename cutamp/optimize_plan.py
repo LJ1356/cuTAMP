@@ -26,6 +26,7 @@ from cutamp.tamp_domain import Conf, Grasp, Pose, Traj
 from cutamp.task_planning import PlanSkeleton
 from cutamp.utils.timer import TorchTimer
 from cutamp.utils.visualizer import Visualizer
+from cutamp.robots.bimanual_yam import YAM_FINGER_CLOSED, YAM_FINGER_OPEN
 
 _log = logging.getLogger(__name__)
 _known_types = {Conf, Grasp, Pose, Traj}
@@ -306,7 +307,9 @@ class ParticleOptimizer:
             q = rollout["confs"][best_idx, ts]
 
             gripper_close = rollout["gripper_close"][ts]
-            if self.config.robot == "ur5":
+            if self.config.robot.startswith("bimanual_yam_"):
+                gripper_joints = [YAM_FINGER_CLOSED] * 2 if gripper_close else [YAM_FINGER_OPEN] * 2
+            elif self.config.robot == "ur5":
                 gripper_joints = [0.4] if gripper_close else [0.0]
             elif self.config.robot == "panda":
                 gripper_joints = [0.01, 0.01] if gripper_close else [0.04, 0.04]

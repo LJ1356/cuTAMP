@@ -14,7 +14,23 @@ from jaxtyping import Float
 
 from cutamp.utils.common import Particles, action_6dof_to_mat4x4, action_4dof_to_mat4x4
 from cutamp.config import TAMPConfiguration
-from cutamp.tamp_domain import MoveFree, MoveHolding, Pick, Place, Push, PushStick, Conf
+from cutamp.tamp_domain import (
+    Conf,
+    Handover,
+    MoveFree,
+    MoveHolding,
+    MoveHoldingBoth,
+    MoveHoldingGiver,
+    MoveHoldingTaker,
+    Pick,
+    PickBoth,
+    PickGiver,
+    Place,
+    PlaceBoth,
+    PlaceTaker,
+    Push,
+    PushStick,
+)
 from cutamp.tamp_world import (
     TAMPWorld,
 )
@@ -53,6 +69,22 @@ class Rollout(TypedDict):
     action_to_ts: Dict[str, int]
     action_to_pose_ts: Dict[str, int]
     ts_to_pose_ts: Dict[int, int]
+    # --- multi-arm only; empty / absent for a single-arm robot -------------------------------- #
+    # A = number of arms. Every timestep constrains ALL arms at once (lockstep operators), so there
+    # is never an idle arm and no activity mask is needed.
+    arm_names: tuple
+    ee_position_arms: Float[torch.Tensor, "num_particles t a 3"]
+    ee_quaternion_arms: Float[torch.Tensor, "num_particles t a 4"]
+    world_from_tool_desired_arms: Float[torch.Tensor, "num_particles t a 4 4"]
+    world_from_ee_desired_arms: Float[torch.Tensor, "num_particles t a 4 4"]
+    # Which arms each timestep constrains. Every entry is True for the lockstep operators, but a
+    # handover is asymmetric -- at the pick only the giver acts -- so the cost function charges only
+    # the ACTIVE (timestep, arm) pairs rather than assuming all of them.
+    arm_active: List[List[bool]]
+    # Per timestep, in arm order, for the ACTIVE arms only. Lines up 1:1 with the action parameters
+    # of that timestep's DualKinematicConstraint.
+    gripper_close_arms: List[List[bool]]
+    action_params_arms: List[List[str]]
 
 
 class RolloutFunction:
@@ -65,6 +97,11 @@ class RolloutFunction:
         self.world = world
         self.config = config
         self.conf_params = get_conf_parameters(plan_skeleton, ignore_initial=True)
+        # Non-empty selects the dual-arm path everywhere below.
+        self.arms = world.robot_container.arms
+        if self.arms:
+            self.arm_link_indices = world.robot_container.arm_link_indices
+            self.tool_from_ee_arms = torch.stack([a.tool_from_ee for a in self.arms])  # (A, 4, 4)
         self.obj_to_initial_pose = {obj.name: self.world.get_object_pose(obj) for obj in self.world.movables}
 
         # Grasp to 4x4 matrix function
@@ -105,7 +142,46 @@ class RolloutFunction:
             robot_spheres_flat = robot_state.get_link_spheres()
             robot_spheres = robot_spheres_flat.view(num_particles, confs.shape[1], -1, 4)
 
-        # Stores the desired actions
+            # Per-arm end-effector poses. One get_state() call already produced every tracked link's
+            # pose, so both hands come from the same forward kinematics -- that is what allows one
+            # configuration to be constrained at both hands. NOTE: cuRobo returns VIEWS into buffers
+            # it reuses on the next get_state() call, so these are cloned.
+            if self.arms:
+                idx = self.arm_link_indices
+                a = len(self.arms)
+                ee_position_arms = robot_state.links_position[:, idx].view(
+                    num_particles, confs.shape[1], a, 3).clone()
+                ee_quaternion_arms = robot_state.links_quaternion[:, idx].view(
+                    num_particles, confs.shape[1], a, 4).clone()
+
+        # Stores the desired actions. In dual-arm mode each entry of `tool_desired_arms` is a
+        # (num_particles, A, 4, 4) stack -- one desired tool pose per arm at that timestep.
+        tool_desired_arms: List[Float[torch.Tensor, "num_particles a 4 4"]] = []
+        gripper_close_arms: List[List[bool]] = []
+        action_params_arms: List[List[str]] = []
+        arm_active: List[List[bool]] = []
+
+        def emit_arm_slot(per_arm: dict):
+            """Record one actionable timestep of a multi-arm rollout.
+
+            ``per_arm`` maps an arm NAME to ``(world_from_tool, gripper_close, action_param)`` and may
+            cover only some arms -- an arm absent from it is idle at this timestep and is neither
+            given a desired pose nor charged a kinematic cost. Inactive slots are filled with the
+            identity purely to keep the stacked tensor rectangular; nothing reads them.
+            """
+            eye = torch.eye(4, device=confs.device).expand(num_particles, 4, 4)
+            poses, closes, names, active = [], [], [], []
+            for spec in self.arms:
+                entry = per_arm.get(spec.name)
+                active.append(entry is not None)
+                poses.append(eye if entry is None else entry[0])
+                if entry is not None:
+                    closes.append(entry[1])
+                    names.append(entry[2])
+            tool_desired_arms.append(torch.stack(poses, dim=1))
+            gripper_close_arms.append(closes)
+            action_params_arms.append(names)
+            arm_active.append(active)
         world_from_tool_desired = []
         gripper_close: List[bool] = []
         action_params: List[str] = []
@@ -144,8 +220,9 @@ class RolloutFunction:
         for ground_op in self.plan_skeleton:
             op_name = ground_op.operator.name
 
-            # Skip MoveFree and MoveHolding as we don't support trajectories yet
-            if op_name == MoveFree.name or op_name == MoveHolding.name:
+            # Skip the Move operators as we don't support trajectories yet
+            if op_name in (MoveFree.name, MoveHolding.name, MoveHoldingBoth.name,
+                           MoveHoldingGiver.name, MoveHoldingTaker.name):
                 continue
 
             # Pick
@@ -187,6 +264,87 @@ class RolloutFunction:
                 world_from_tool_desired.append(world_from_tool)
                 gripper_close.append(False)  # opening gripper at Place
                 action_params.append(place_name)
+                action_to_ts[place_name] = ts
+                action_to_pose_ts[place_name] = pose_ts
+                ts_to_pose_ts[ts] = pose_ts
+
+
+            # PickBoth -- one configuration, both hands grasping a different object
+            elif op_name == PickBoth.name:
+                obj_a, grasp_a, obj_b, grasp_b, _ = ground_op.values
+                slot = {}
+                for spec, obj_name, grasp_name in zip(self.arms, (obj_a, obj_b), (grasp_a, grasp_b)):
+                    slot[spec.name] = (current_pose(obj_name) @ get_grasp_mat4x4(grasp_name), True, grasp_name)
+                    action_to_ts[grasp_name] = ts
+                    action_to_pose_ts[grasp_name] = pose_ts
+                emit_arm_slot(slot)
+
+            # PlaceBoth -- one configuration, both hands releasing. Both objects move at the SAME
+            # pose timestep (unlike two sequential Places, which advance pose_ts once each).
+            elif op_name == PlaceBoth.name:
+                obj_a, grasp_a, place_a, _, obj_b, grasp_b, place_b, _, _ = ground_op.values
+                new_poses, slot = {}, {}
+                for spec, obj_name, grasp_name, place_name in zip(
+                    self.arms, (obj_a, obj_b), (grasp_a, grasp_b), (place_a, place_b)
+                ):
+                    world_from_obj = action_4dof_to_mat4x4(particles[place_name])
+                    new_poses[obj_name] = world_from_obj
+                    slot[spec.name] = (world_from_obj @ get_grasp_mat4x4(grasp_name), False, place_name)
+                for obj in self.world.movables:
+                    obj_to_pose[obj.name].append(new_poses.get(obj.name, current_pose(obj.name)))
+                pose_ts += 1
+                for place_name in (place_a, place_b):
+                    action_to_ts[place_name] = ts
+                    action_to_pose_ts[place_name] = pose_ts
+                ts_to_pose_ts[ts] = pose_ts
+                emit_arm_slot(slot)
+
+            # PickGiver -- only the GIVER arm acts; the taker is idle and uncharged.
+            elif op_name == PickGiver.name:
+                obj_name, grasp_name, _ = ground_op.values
+                giver = self.arms[0]
+                emit_arm_slot({giver.name: (current_pose(obj_name) @ get_grasp_mat4x4(grasp_name),
+                                            True, grasp_name)})
+                action_to_ts[grasp_name] = ts
+                action_to_pose_ts[grasp_name] = pose_ts
+
+            # Handover -- BOTH hands on the same object at one configuration. The object's pose is a
+            # free parameter (mid-air, not on any surface); each hand's desired tool pose is that one
+            # pose seen through its own grasp, which is what makes this an exchange rather than two
+            # independent reaches. The giver releases and the taker closes at this instant.
+            elif op_name == Handover.name:
+                obj_name, grasp_g_name, grasp_t_name, hand_pose_name, _ = ground_op.values
+                world_from_obj = action_4dof_to_mat4x4(particles[hand_pose_name])
+                giver, taker = self.arms[0], self.arms[1]
+                emit_arm_slot({
+                    giver.name: (world_from_obj @ get_grasp_mat4x4(grasp_g_name), False, grasp_g_name),
+                    taker.name: (world_from_obj @ get_grasp_mat4x4(grasp_t_name), True, grasp_t_name),
+                })
+                # The object moves to the handover pose, so this advances the pose timeline exactly
+                # like a Place does -- collision checking of the object against the world at this
+                # timestep is what keeps the exchange above the table.
+                for obj in self.world.movables:
+                    obj_to_pose[obj.name].append(
+                        world_from_obj if obj.name == obj_name else current_pose(obj.name)
+                    )
+                pose_ts += 1
+                for name in (grasp_g_name, grasp_t_name, hand_pose_name):
+                    action_to_ts[name] = ts
+                    action_to_pose_ts[name] = pose_ts
+                ts_to_pose_ts[ts] = pose_ts
+
+            # PlaceTaker -- only the TAKER arm acts.
+            elif op_name == PlaceTaker.name:
+                obj_name, grasp_name, place_name, _, _ = ground_op.values
+                taker = self.arms[1]
+                world_from_obj = action_4dof_to_mat4x4(particles[place_name])
+                emit_arm_slot({taker.name: (world_from_obj @ get_grasp_mat4x4(grasp_name),
+                                            False, place_name)})
+                for obj in self.world.movables:
+                    obj_to_pose[obj.name].append(
+                        world_from_obj if obj.name == obj_name else current_pose(obj.name)
+                    )
+                pose_ts += 1
                 action_to_ts[place_name] = ts
                 action_to_pose_ts[place_name] = pose_ts
                 ts_to_pose_ts[ts] = pose_ts
@@ -240,8 +398,24 @@ class RolloutFunction:
             ts += 1
 
         # Stack and store in rollout
-        world_from_tool_desired = torch.stack(world_from_tool_desired, dim=1)
-        world_from_ee_desired = world_from_tool_desired @ self.world.tool_from_ee
+        if self.arms:
+            world_from_tool_desired_arms = torch.stack(tool_desired_arms, dim=1)          # (b, T, A, 4, 4)
+            world_from_ee_desired_arms = world_from_tool_desired_arms @ self.tool_from_ee_arms
+            # The single-arm keys mirror the FIRST arm so every downstream consumer that has not been
+            # taught about arms (shape assertions, soft costs, plan-graph export) still sees a
+            # well-formed rollout rather than an empty stack.
+            first = [next(i for i, on in enumerate(row) if on) for row in arm_active]
+            sel = torch.arange(len(first), device=confs.device), torch.tensor(first, device=confs.device)
+            world_from_tool_desired = world_from_tool_desired_arms[:, sel[0], sel[1]]
+            world_from_ee_desired = world_from_ee_desired_arms[:, sel[0], sel[1]]
+            gripper_close = [g[0] for g in gripper_close_arms]
+            action_params = [p[0] for p in action_params_arms]
+        else:
+            world_from_tool_desired = torch.stack(world_from_tool_desired, dim=1)
+            world_from_ee_desired = world_from_tool_desired @ self.world.tool_from_ee
+            ee_position_arms = ee_quaternion_arms = None
+            world_from_tool_desired_arms = world_from_ee_desired_arms = None
+            arm_active = []
 
         # Object poses for each timestep
         obj_to_pose = {k: torch.stack(v, dim=1) for k, v in obj_to_pose.items()}
@@ -275,5 +449,13 @@ class RolloutFunction:
             action_to_ts=action_to_ts,
             action_to_pose_ts=action_to_pose_ts,
             ts_to_pose_ts=ts_to_pose_ts,
+            arm_names=tuple(a.name for a in self.arms),
+            arm_active=arm_active,
+            ee_position_arms=ee_position_arms,
+            ee_quaternion_arms=ee_quaternion_arms,
+            world_from_tool_desired_arms=world_from_tool_desired_arms,
+            world_from_ee_desired_arms=world_from_ee_desired_arms,
+            gripper_close_arms=gripper_close_arms,
+            action_params_arms=action_params_arms,
         )
         return rollout

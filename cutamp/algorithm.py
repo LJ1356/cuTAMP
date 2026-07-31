@@ -28,17 +28,18 @@ from cutamp.cost_function import CostFunction
 from cutamp.cost_reduction import CostReducer
 from cutamp.envs.utils import TAMPEnvironment
 from cutamp.experiment_logger import ExperimentLogger
-from cutamp.motion_solver import solve_curobo, MotionPlanningError
+from cutamp.motion_solver import solve_curobo, solve_curobo_dual, MotionPlanningError
 from cutamp.optimize_plan import ParticleOptimizer
 from cutamp.particle_initialization import ParticleInitializer
 from cutamp.robots import get_q_home, load_robot_container
 from cutamp.rollout import RolloutFunction
-from cutamp.tamp_domain import all_tamp_operators
+from cutamp.tamp_domain import all_tamp_operators, dual_tamp_operators, handover_tamp_operators
 from cutamp.tamp_world import TAMPWorld, check_tamp_world_not_in_collision
 from cutamp.task_planning import PlanSkeleton, task_plan_generator
 from cutamp.utils.common import get_world_cfg
 from cutamp.utils.timer import TorchTimer
 from cutamp.utils.visualizer import RerunVisualizer, MockVisualizer, Visualizer
+from cutamp.robots.bimanual_yam import YAM_FINGER_CLOSED, YAM_FINGER_OPEN
 
 _log = logging.getLogger(__name__)
 
@@ -125,7 +126,9 @@ def _visualize_best_particle(
         q = rollout["confs"][best_idx, ts]
 
         gripper_close = rollout["gripper_close"][ts]
-        if config.robot == "ur5":
+        if config.robot.startswith("bimanual_yam_"):
+            gripper_joints = [YAM_FINGER_CLOSED] * 2 if gripper_close else [YAM_FINGER_OPEN] * 2
+        elif config.robot == "ur5":
             gripper_joints = [0.4] if gripper_close else [0.0]
         elif config.robot == "panda":
             gripper_joints = [0.01, 0.01] if gripper_close else [0.04, 0.04]
@@ -434,6 +437,19 @@ def _save_final_plan_graph(plan_skeleton, plan_info, world, config, constraint_c
     _log.info("Saved plan graph: " + ", ".join(f"{k}={v}" for k, v in paths.items()))
 
 
+def _operators_for(config) -> list:
+    """Which operator set builds the plan skeleton.
+
+    Each set is self-consistent about hand state, so they are never mixed: `dual` is lockstep (both
+    hands always act together, HandEmpty means both empty), `handover` is asymmetric (one hand holds
+    while the other is free), and `single` is the original one-chain domain. A skeleton mixing them
+    could leave the hand state ambiguous.
+    """
+    if config.arm_mode != "dual":
+        return all_tamp_operators
+    return handover_tamp_operators if config.dual_task == "handover" else dual_tamp_operators
+
+
 def run_cutamp(
     env: TAMPEnvironment,
     config: TAMPConfiguration,
@@ -461,7 +477,10 @@ def run_cutamp(
         plan_gen = task_plan_generator(
             world.initial_state,
             world.goal_state,
-            operators=all_tamp_operators,
+            # Dual-arm skeletons come from a SEPARATE operator list so a plan can never mix a
+            # lockstep two-hand operator with a single-hand one (which would break the invariant
+            # that both hands are always in the same state).
+            operators=_operators_for(config),
             explored_state_check=config.explored_state_check,
         )
 
@@ -682,7 +701,11 @@ def run_cutamp(
                     _log.info(f"Trying cuRobo planning with satisfying particle {curr_idx + 1}/{max_attempts} ({num_satisfying} total satisfying)")
                     curr_particle = {k: v[curr_idx] for k, v in ranked_particles.items()}
                     try:
-                        curobo_plan = solve_curobo(
+                        # Dual-arm skeletons plan in configuration space (plan_single_js between the
+                        # optimized 12-DOF configurations); solve_curobo's pose targets would
+                        # constrain only one hand. See solve_curobo_dual.
+                        solver = solve_curobo_dual if config.arm_mode == "dual" else solve_curobo
+                        curobo_plan = solver(
                             plan_info,
                             curr_particle,
                             world,

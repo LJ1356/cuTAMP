@@ -30,6 +30,7 @@ from cutamp.task_planning.constraints import (
     CollisionFreeGrasp,
     CollisionFreeHolding,
     CollisionFreePlacement,
+    DualKinematicConstraint,
     KinematicConstraint,
     Motion,
     StablePlacement,
@@ -61,6 +62,8 @@ class CostFunction:
         # Accumulate the constraints, so we can batch them up when computing the costs
         self.cfree_constraints = []
         self.kinematic_constraints = []
+        self.dual_kinematic_constraints = []
+        self._active_slots = None  # cached (timestep, arm) index pair; see dual_kinematic_costs
         self.motion_constraints = []
         self.stable_placement_constraints = []
         self.valid_push_constraints = []
@@ -70,6 +73,7 @@ class CostFunction:
 
         type_to_list = {
             KinematicConstraint.type: self.kinematic_constraints,
+            DualKinematicConstraint.type: self.dual_kinematic_constraints,
             Motion.type: self.motion_constraints,
             CollisionFree.type: self.cfree_constraints,
             CollisionFreeHolding.type: self.cfree_constraints,
@@ -95,10 +99,19 @@ class CostFunction:
         # timestep in grasp_orientation_costs. Only active when a multiplier is set (opt-in).
         self.grasp_cost_action_names = [cost.params[1] for cost in self.grasp_costs]
         self.init_ee_rotmat = None
+        self.init_ee_rotmat_arms = None
         if self.grasp_costs and self.config.grasp_orientation_cost:
             q_init = self.world.q_init.view(1, -1)
-            init_ee_mat = self.world.kin_model.get_state(q_init).ee_pose.get_matrix()  # (1, 4, 4)
+            init_state = self.world.kin_model.get_state(q_init)
+            init_ee_mat = init_state.ee_pose.get_matrix()  # (1, 4, 4)
             self.init_ee_rotmat = init_ee_mat[:, :3, :3].detach()  # (1, 3, 3), constant reference
+            if self.world.arms:
+                # One reference orientation per hand. Cloned because cuRobo hands back views into
+                # buffers it overwrites on the next get_state() call.
+                self.init_ee_rotmat_arms = torch.stack([
+                    init_state.link_pose[spec.ee_link].get_matrix()[0, :3, :3]
+                    for spec in self.world.arms
+                ]).detach().clone()  # (A, 3, 3)
 
         # All conf parameters for motion constraints, we check rollout is subset
         self.motion_conf_params = set(
@@ -117,10 +130,23 @@ class CostFunction:
         if not self.self_collision_cost_fn.self_collision_kin_config.experimental_kernel:
             raise ValueError("Expected self-collision cost to use experimental kernel")
 
-        # Conf parameters for kinematic constraints, order in rollout should match
-        self.kinematic_confs, self.kinematic_actions = zip(*(con.params for con in self.kinematic_constraints))
-        self.kinematic_confs = list(self.kinematic_confs)
-        self.kinematic_actions = list(self.kinematic_actions)
+        # Conf parameters for kinematic constraints, order in rollout should match. A skeleton uses
+        # either the single-arm or the dual-arm operator set, never both, so exactly one of these two
+        # lists is populated; zip(*[]) would otherwise fail to unpack into two names.
+        if self.kinematic_constraints and self.dual_kinematic_constraints:
+            raise NotImplementedError("Mixed single-arm and dual-arm kinematic constraints in one skeleton")
+        if self.kinematic_constraints:
+            self.kinematic_confs, self.kinematic_actions = map(
+                list, zip(*(con.params for con in self.kinematic_constraints))
+            )
+        else:
+            self.kinematic_confs, self.kinematic_actions = [], []
+        # conf per timestep, and the per-arm action names at that timestep (T x A)
+        self.dual_kinematic_confs = [con.params[0] for con in self.dual_kinematic_constraints]
+        self.dual_kinematic_actions = [list(con.params[1:]) for con in self.dual_kinematic_constraints]
+        self.action_to_arm_idx = {
+            name: i for row in self.dual_kinematic_actions for i, name in enumerate(row)
+        }
 
         # Compute the AABB and surface z-position for the placement surfaces
         self.surface_to_aabb = {}
@@ -216,10 +242,32 @@ class CostFunction:
                 self.activated_obj.add(obj)
                 if obj not in self.obj_to_first_place:
                     self.obj_to_first_place[obj] = pose
+            elif op_name == "PickBoth":
+                v = ground_op.values
+                self.activated_obj.update({v[0], v[2]})
+            elif op_name == "PlaceBoth":
+                v = ground_op.values
+                for obj, pose in ((v[0], v[2]), (v[4], v[6])):
+                    self.activated_obj.add(obj)
+                    self.obj_to_first_place.setdefault(obj, pose)
+            elif op_name == "PickGiver":
+                self.activated_obj.add(ground_op.values[0])
+            elif op_name == "Handover":
+                # The object moves to the handover pose, so that pose activates it exactly like a
+                # placement does -- which is what makes it collision-checked against the world and so
+                # keeps the exchange off the table.
+                obj, hand_pose = ground_op.values[0], ground_op.values[3]
+                self.activated_obj.add(obj)
+                self.obj_to_first_place.setdefault(obj, hand_pose)
+            elif op_name == "PlaceTaker":
+                obj, pose = ground_op.values[0], ground_op.values[2]
+                self.activated_obj.add(obj)
+                self.obj_to_first_place.setdefault(obj, pose)
             elif op_name == "PushStick" or op_name == "Push":
                 raise NotImplementedError(f"Haven't handled {op_name}")
             else:
-                assert op_name == "MoveFree" or op_name == "MoveHolding"
+                assert op_name in ("MoveFree", "MoveHolding", "MoveHoldingBoth",
+                                   "MoveHoldingGiver", "MoveHoldingTaker")
 
         # Pre-compute movable object pairs for collision checking.
         # Only include pairs where at least one object is manipulated
@@ -252,10 +300,23 @@ class CostFunction:
             )
 
         # Kinematic configuration and actions (i.e., poses) should match
-        if self.kinematic_confs != rollout["conf_params"]:
-            raise RuntimeError(f"Expected conf params {self.kinematic_confs} but got {rollout['conf_params']}")
-        if self.kinematic_actions != rollout["action_params"]:
-            raise RuntimeError(f"Expected action params {self.kinematic_actions} but got {rollout['action_params']}")
+        if self.dual_kinematic_constraints:
+            if self.dual_kinematic_confs != rollout["conf_params"]:
+                raise RuntimeError(
+                    f"Expected conf params {self.dual_kinematic_confs} but got {rollout['conf_params']}"
+                )
+            if self.dual_kinematic_actions != rollout["action_params_arms"]:
+                raise RuntimeError(
+                    f"Expected per-arm action params {self.dual_kinematic_actions} "
+                    f"but got {rollout['action_params_arms']}"
+                )
+        else:
+            if self.kinematic_confs != rollout["conf_params"]:
+                raise RuntimeError(f"Expected conf params {self.kinematic_confs} but got {rollout['conf_params']}")
+            if self.kinematic_actions != rollout["action_params"]:
+                raise RuntimeError(
+                    f"Expected action params {self.kinematic_actions} but got {rollout['action_params']}"
+                )
 
         # Trajectory length parameters should match
         if self.traj_length_confs != rollout["conf_params"]:
@@ -281,8 +342,51 @@ class CostFunction:
 
         self._rollout_validated = True
 
+    def dual_kinematic_costs(self, rollout: Rollout) -> Union[dict, None]:
+        """Pose error at EVERY arm, for a configuration constrained at both hands at once.
+
+        The arm axis is folded into the time axis: values come out as ``(b, T*A)``. That is exactly
+        what the downstream reducers already expect -- ``CostReducer`` sums ``dim=1`` (charge every
+        (timestep, arm)) and ``ConstraintChecker`` does ``.all(dim=1)`` (satisfy at every (timestep,
+        arm)) -- so neither needs to learn about arms. Emitting under ``KinematicConstraint.type``
+        with the same ``pos_err``/``rot_err`` names also reuses the registered multipliers and
+        tolerances, instead of silently defaulting to weight 1.0 and tolerance 0.0.
+        """
+        if not self.dual_kinematic_constraints:
+            return None
+        # Gather ONLY the (timestep, arm) pairs this skeleton actually constrains. For the lockstep
+        # operators that is every pair, but a handover leaves one hand idle at the pick and the other
+        # idle at the place, and charging an idle hand against a meaningless desired pose would make
+        # every particle infeasible.
+        if self._active_slots is None:
+            active = rollout["arm_active"]
+            pairs = [(t, a) for t, row in enumerate(active) for a, on in enumerate(row) if on]
+            dev = rollout["ee_position_arms"].device
+            self._active_slots = (
+                torch.tensor([t for t, _ in pairs], dtype=torch.long, device=dev),
+                torch.tensor([a for _, a in pairs], dtype=torch.long, device=dev),
+            )
+        t_idx, a_idx = self._active_slots
+        ee_pos = rollout["ee_position_arms"][:, t_idx, a_idx]        # (b, n_active, 3)
+        ee_quat = rollout["ee_quaternion_arms"][:, t_idx, a_idx]
+        desired = rollout["world_from_ee_desired_arms"][:, t_idx, a_idx]
+        b, n = ee_pos.shape[:2]
+        ee_pose = Pose(position=ee_pos.reshape(-1, 3), quaternion=ee_quat.reshape(-1, 4),
+                       normalize_rotation=False)
+        p_dist, quat_dist = ee_pose.distance(Pose.from_matrix(desired.reshape(-1, 4, 4)))
+        # Flattening (timestep, arm) into one axis is what lets CostReducer's sum over dim=1 and
+        # ConstraintChecker's .all(dim=1) mean "charge every constrained hand" / "satisfy at every
+        # constrained hand" without either of them knowing about arms.
+        return {
+            "type": "constraint",
+            "constraints": self.dual_kinematic_constraints,
+            "values": {"pos_err": p_dist.reshape(b, n), "rot_err": quat_dist.reshape(b, n)},
+        }
+
     def kinematic_costs(self, rollout: Rollout) -> Union[dict, None]:
         """Kinematic constraints - i.e., pose error between actual and desired end-effector poses."""
+        if not self.kinematic_constraints:
+            return None
         # FK side: build a Pose from stored position+quaternion to skip the matrix round-trip.
         # Desired side is a 4x4 built from matrix multiplication upstream, so it still needs from_matrix.
         ee_pose = Pose(
@@ -472,8 +576,16 @@ class CostFunction:
             return None
         # EE orientation desired at each grasp's timestep (same "ee" frame as kinematic_costs uses).
         ts_idxs = [rollout["action_to_ts"][name] for name in self.grasp_cost_action_names]
-        grasp_rotmat = rollout["world_from_ee_desired"][:, ts_idxs, :3, :3]  # (b, k, 3, 3)
-        init_rotmat = self.init_ee_rotmat.view(1, 1, 3, 3).expand_as(grasp_rotmat)
+        if self.init_ee_rotmat_arms is not None:
+            # Dual-arm: index the (t, arm) slot each grasp belongs to, and compare against THAT
+            # hand's initial orientation -- the two hands start mirrored, so one shared reference
+            # would charge the right arm for the left arm's starting pose.
+            arm_idxs = [self.action_to_arm_idx[name] for name in self.grasp_cost_action_names]
+            grasp_rotmat = rollout["world_from_ee_desired_arms"][:, ts_idxs, arm_idxs, :3, :3]
+            init_rotmat = self.init_ee_rotmat_arms[arm_idxs].unsqueeze(0).expand_as(grasp_rotmat)
+        else:
+            grasp_rotmat = rollout["world_from_ee_desired"][:, ts_idxs, :3, :3]  # (b, k, 3, 3)
+            init_rotmat = self.init_ee_rotmat.view(1, 1, 3, 3).expand_as(grasp_rotmat)
         # Geodesic distance on SO(3) in radians; roma clamps internally to keep gradients stable.
         grasp_rot_change = roma.rotmat_geodesic_distance(grasp_rotmat, init_rotmat)  # (b, k)
         return {
@@ -651,9 +763,13 @@ class CostFunction:
             motion_cost = self.motion_costs(rollout)
         add_cost(Motion.type, motion_cost)
 
-        # Kinematic costs
+        # Kinematic costs. A skeleton is single-arm or dual-arm, never both, so exactly one of these
+        # returns a value; both emit under KinematicConstraint.type so the registered multipliers and
+        # tolerances apply either way.
         with torch.profiler.record_function("cost::kinematic"):
             kinematic_cost = self.kinematic_costs(rollout)
+            if kinematic_cost is None:
+                kinematic_cost = self.dual_kinematic_costs(rollout)
         add_cost(KinematicConstraint.type, kinematic_cost)
 
         # Soft costs

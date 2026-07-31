@@ -16,8 +16,23 @@ class TAMPConfiguration:
     # Number of particles to initialize and optimize over
     num_particles: int = 1024
 
-    # Robot embodiment to use
-    robot: Literal["panda", "fr3_robotiq", "ur5", "panda_robotiq", "fr3_franka"] = "panda"
+    # Robot embodiment to use. The bimanual YAM appears once per arm because cuTAMP plans a single
+    # kinematic chain: the active arm is fixed by that config's ee_link + lock_joints.
+    robot: Literal[
+        "panda", "fr3_robotiq", "ur5", "panda_robotiq", "fr3_franka",
+        "bimanual_yam_left", "bimanual_yam_right", "bimanual_yam_dual",
+    ] = "panda"
+
+    # "single" = one kinematic chain, the original domain (Pick/Place/MoveFree/MoveHolding).
+    # "dual"   = both arms as one chain acting in LOCKSTEP, using dual_tamp_operators: each timestep
+    #            has one shared configuration constrained at BOTH hands, so the two arms pick and
+    #            place simultaneously. Requires a multi-arm robot; see cutamp/robots ArmSpec.
+    arm_mode: Literal["single", "dual"] = "single"
+
+    # Which dual-arm operator set to plan with (ignored unless arm_mode == "dual").
+    #   "parallel" -- lockstep: both hands pick, and both place, at the same configuration.
+    #   "handover" -- asymmetric: one hand picks, both hands meet on the object, the other carries on.
+    dual_task: Literal["parallel", "handover"] = "parallel"
 
     # Grasp and Placements
     grasp_dof: Literal[4, 6] = 4
@@ -132,8 +147,20 @@ class TAMPConfiguration:
 def validate_tamp_config(config: TAMPConfiguration):
     if config.num_particles <= 0:
         raise ValueError(f"num_particles must be positive, not {config.num_particles}")
-    if config.robot not in {"panda", "fr3_robotiq", "ur5", "panda_robotiq", "fr3_franka"}:
+    if config.robot not in {
+        "panda", "fr3_robotiq", "ur5", "panda_robotiq", "fr3_franka",
+        "bimanual_yam_left", "bimanual_yam_right", "bimanual_yam_dual",
+    }:
         raise ValueError(f"Invalid embodiment: {config.robot}")
+    if config.arm_mode not in {"single", "dual"}:
+        raise ValueError(f"Invalid arm_mode: {config.arm_mode}")
+    if config.dual_task not in {"parallel", "handover"}:
+        raise ValueError(f"Invalid dual_task: {config.dual_task}")
+    if (config.arm_mode == "dual") != (config.robot == "bimanual_yam_dual"):
+        raise ValueError(
+            f"arm_mode={config.arm_mode!r} does not match robot={config.robot!r}; "
+            "dual-arm planning needs the 12-DOF 'bimanual_yam_dual' embodiment and vice versa"
+        )
     if config.grasp_dof not in {4, 6}:
         raise ValueError(f"Invalid grasp_dof: {config.grasp_dof}")
     if config.place_dof not in {4}:

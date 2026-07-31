@@ -17,13 +17,29 @@ from curobo.types.math import Pose
 
 from cutamp.config import TAMPConfiguration
 from cutamp.costs import sphere_to_sphere_overlap
+from cutamp.robots.bimanual_yam import bimanual_yam_neutral_joint_positions
 from cutamp.samplers import (
     grasp_4dof_sampler,
     grasp_6dof_sampler,
     place_4dof_sampler,
     sample_yaw,
 )
-from cutamp.tamp_domain import MoveFree, MoveHolding, Pick, Place, Push, PushStick
+from cutamp.tamp_domain import (
+    Handover,
+    MoveFree,
+    MoveHolding,
+    MoveHoldingBoth,
+    MoveHoldingGiver,
+    MoveHoldingTaker,
+    Pick,
+    PickBoth,
+    PickGiver,
+    Place,
+    PlaceBoth,
+    PlaceTaker,
+    Push,
+    PushStick,
+)
 from cutamp.tamp_world import TAMPWorld
 from cutamp.task_planning import PlanSkeleton
 from cutamp.utils.common import (
@@ -37,6 +53,11 @@ from cutamp.utils.common import (
 from cutamp.utils.shapes import MultiSphere
 
 _log = logging.getLogger(__name__)
+
+# How far out along the object each hand grasps for a handover, as a fraction of the usable
+# half-length, and how much of the end is left unusable so the pads stay on solid material.
+_HANDOVER_END_FRACTION = (0.55, 1.0)
+_HANDOVER_END_MARGIN = 0.02
 
 
 class ParticleInitializer:
@@ -57,11 +78,217 @@ class ParticleInitializer:
         self.grasps = grasps
 
         # Sampler caching
+        self._arm_sphere_rows = None
         self.pick_cache = {}
         self.place_cache = {}
         self.push_button_cache = {}
         self.push_stick_cache = {}
         self.failed_push = set()
+
+    def _cross_arm_sphere_rows(self):
+        """Row indices into the link-sphere tensor for each arm, cached.
+
+        Used to score how close two independently-solved arm configurations come to each other.
+        """
+        if getattr(self, "_arm_sphere_rows", None) is None:
+            kc = self.world.kin_model.kinematics_config
+            idx_to_link = {v: k for k, v in kc.link_name_to_idx_map.items()}
+            link_of_sphere = [idx_to_link[int(i)] for i in kc.link_sphere_idx_map.cpu().numpy()]
+            self._arm_sphere_rows = [
+                torch.tensor(
+                    [r for r, link in enumerate(link_of_sphere) if link.startswith(f"{spec.name}_")],
+                    dtype=torch.long, device=self.world.tensor_args.device,
+                )
+                for spec in self.world.arms
+            ]
+        return self._arm_sphere_rows
+
+    def _cross_arm_gap(self, q):
+        """Smallest gap between any sphere of one arm and any sphere of another, per configuration.
+
+        Negative means the arms interpenetrate. Only CROSS-arm pairs are scored: within one arm the
+        neighbouring links always touch, which is what the cuRobo config's self_collision_ignore is
+        for.
+        """
+        spheres = self.world.kin_model.get_state(q).get_link_spheres()  # (b, n, 4)
+        rows_a, rows_b = self._cross_arm_sphere_rows()[0], self._cross_arm_sphere_rows()[1]
+        a, b = spheres[:, rows_a], spheres[:, rows_b]
+        active = (a[..., 3] > 0).unsqueeze(2) & (b[..., 3] > 0).unsqueeze(1)
+        dist = torch.cdist(a[..., :3], b[..., :3]) - a[..., 3].unsqueeze(2) - b[..., 3].unsqueeze(1)
+        return dist.masked_fill(~active, float("inf")).amin(dim=(1, 2))
+
+    def _seed_dual_conf(self, arm_to_world_from_ee: dict, num_particles: int, header: str, log_debug,
+                        num_branches: int = 4):
+        """Seed a multi-arm configuration from per-arm IK, choosing branches that do not collide.
+
+        cuRobo has no simultaneous multi-pose IK, and cuTAMP does not need one: these are only the
+        INITIAL particles, which the optimizer then refines against the dual kinematic cost. Because
+        the arms share no joints, solving each against its own single-arm config and writing the
+        results into that arm's column slice reproduces every target pose exactly through the shared
+        forward kinematics.
+
+        The catch is that each arm's IK runs with the OTHER arm parked at its neutral pose, so two
+        independently-chosen elbow branches routinely intersect -- and once the hands are pinned by
+        the kinematic constraint, the optimizer has no easy path out of that. So several IK branches
+        are requested per arm and the combination with the largest cross-arm clearance is kept.
+        With 2 arms and k branches that is k**2 candidates, evaluated batched.
+
+        Returns ``(q, both_solved_mask)``.
+        """
+        world = self.world
+        dof = world.robot_container.joint_limits.shape[1]
+        device = world.tensor_args.device
+
+        # An arm with no target is IDLE at this timestep (asymmetric operators like PickGiver), and is
+        # parked at the retract posture -- the same one cuRobo's per-arm configs lock it at, so the
+        # single-arm IK solves are consistent with where the idle arm actually is.
+        parked = torch.tensor(bimanual_yam_neutral_joint_positions, dtype=torch.float32, device=device)
+
+        per_arm = []
+        both_ok = torch.ones(num_particles, dtype=torch.bool, device=device)
+        for spec in world.arms:
+            target = arm_to_world_from_ee.get(spec.name)
+            if target is None:
+                per_arm.append(parked.view(1, 1, -1).expand(num_particles, num_branches, -1))
+                continue
+            res = world.ik_solvers[spec.name].solve_batch(
+                Pose.from_matrix(target), seed_config=None, return_seeds=num_branches,
+            )
+            per_arm.append(res.solution)                      # (b, k, 6)
+            both_ok &= res.success.any(dim=-1).flatten()
+            log_debug(f"{header}. {spec.name} IK success: {int(res.success.any(dim=-1).sum())}/{num_particles}")
+
+        k = min(num_branches, *[sol.shape[1] for sol in per_arm])
+        best_q = torch.zeros((num_particles, dof), device=device)
+        best_gap = torch.full((num_particles,), -float("inf"), device=device)
+        for i in range(k):
+            for j in range(k):
+                cand = torch.zeros((num_particles, dof), device=device)
+                cand[:, world.arms[0].joint_slice] = per_arm[0][:, i]
+                cand[:, world.arms[1].joint_slice] = per_arm[1][:, j]
+                gap = self._cross_arm_gap(cand)
+                better = gap > best_gap
+                best_gap = torch.where(better, gap, best_gap)
+                best_q[better] = cand[better]
+
+        clear = best_gap > 0
+        n_ok = int((both_ok & clear).sum())
+        log_debug(
+            f"{header}. both arms solved: {int(both_ok.sum())}/{num_particles}; "
+            f"of those, {n_ok} with the arms clear of each other "
+            f"(best cross-arm gap {float(best_gap.max()) * 1000:.1f} mm)"
+        )
+        usable = both_ok & clear
+        n_usable = int(usable.sum())
+        if 0 < n_usable < num_particles:
+            # Replace unusable particles with copies of usable ones, so the optimizer starts from a
+            # full population rather than one padded with self-colliding configurations it cannot
+            # escape once the kinematic constraint pins the hands.
+            ok_idx = torch.nonzero(usable, as_tuple=False).flatten()
+            fill = ok_idx[torch.randint(0, n_usable, (int((~usable).sum()),), device=ok_idx.device)]
+            best_q[~usable] = best_q[fill]
+        return best_q, usable
+
+    def _sample_grasps(self, obj: str, num_particles: int):
+        """Sample, collision-filter and rank candidate grasps for one object.
+
+        Extracted verbatim out of the ``Pick`` branch so ``PickBoth`` can call it once per hand.
+        The single-arm path calls it exactly where the inline code used to run, so its behaviour is
+        unchanged. Returns ``(selected_grasps, selected_confs, is_mat4x4)``.
+        """
+        config, world = self.config, self.world
+        # Sample grasps
+        obj_curobo = world.get_object(obj)
+        num_faces = 4 if isinstance(obj_curobo, Cuboid) else None
+        obj_spheres = world.get_collision_spheres(obj)
+        num_samples = num_particles * 2  # oversample at first
+        sampled_confs = None
+        is_mat4x4 = False
+
+        if config.m2t2_grasps and self.grasps and len(self.grasps[obj]["grasps_obj"]) > 0:
+            _log.debug(f"Using M2T2 grasps for {obj}")
+            provided_grasps = self.grasps[obj]["grasps_obj"]
+            confs = self.grasps[obj]["confidences_pt"]
+            # Sample randomly with replacement if needed
+            sample_idxs = torch.randint(
+                0, provided_grasps.shape[0], (num_samples,), device=provided_grasps.device
+            )
+            sampled_grasps = provided_grasps[sample_idxs]
+            sampled_confs = confs[sample_idxs]
+            obj_from_grasp = sampled_grasps
+            is_mat4x4 = True
+        elif config.grasp_dof == 4:
+            _log.debug(f"Falling back to 4-DOF heuristic grasps for {obj}")
+            sampled_grasps = grasp_4dof_sampler(num_samples, obj_curobo, obj_spheres, num_faces=num_faces)
+            obj_from_grasp = action_4dof_to_mat4x4(sampled_grasps)
+        else:
+            _log.debug(f"Falling back to 6-DOF heuristic grasps for {obj}")
+            sampled_grasps = grasp_6dof_sampler(num_samples, obj_curobo, num_faces=num_faces)
+            obj_from_grasp = action_6dof_to_mat4x4(sampled_grasps)
+
+        # Filter grasps by collision with object
+        grasp_spheres = transform_spheres(world.robot_container.gripper_spheres, obj_from_grasp)
+        grasp_coll = sphere_to_sphere_overlap(obj_spheres, grasp_spheres, activation_distance=0.0)
+
+        # Select grasps: use collision-free only, or fall back to lowest collision
+        collision_free_mask = grasp_coll <= 1e-2
+        if collision_free_mask.any():
+            # Use only collision-free grasps, sorted by confidence if available
+            cfree_grasps = sampled_grasps[collision_free_mask]
+
+            if sampled_confs is not None:
+                cfree_confs = sampled_confs[collision_free_mask]
+                sort_idxs = torch.argsort(cfree_confs, descending=True)[:num_particles]
+                selected_grasps = cfree_grasps[sort_idxs]
+                selected_confs = cfree_confs[sort_idxs]
+            else:
+                selected_grasps = cfree_grasps[:num_particles]
+                selected_confs = None
+        else:
+            # No collision-free grasps, take lowest collision scores
+            best_idxs = grasp_coll.topk(num_particles, largest=False).indices
+            selected_grasps = sampled_grasps[best_idxs]
+            selected_confs = sampled_confs[best_idxs] if sampled_confs is not None else None
+
+        # Sample with replacement if we don't have enough grasps
+        if selected_grasps.shape[0] < num_particles:
+            sample_idxs = torch.randint(
+                0, selected_grasps.shape[0], (num_particles,), device=selected_grasps.device
+            )
+            selected_grasps = selected_grasps[sample_idxs]
+            if selected_confs is not None:
+                selected_confs = selected_confs[sample_idxs]
+
+        return selected_grasps, selected_confs, is_mat4x4
+
+    def _slide_grasps_to_end(self, grasps, is_mat4x4: bool, obj: str, sign: float):
+        """Slide grasps toward one END of the object's longest horizontal axis, in the object frame.
+
+        A handover needs the two hands on OPPOSITE ends of the object -- two 10 cm YAM grippers meeting
+        at the same point leave ~1 mm of arm clearance, while a 22 cm bar held at +/-8 cm leaves
+        ~127 mm. The heuristic 4-DOF sampler cannot express that: it pins every grasp to the object's
+        vertical axis (``translation[:, :2] = 0``), so every candidate it emits is at the same point and
+        no amount of "pick the farthest candidate" can separate them. So the offset is applied here.
+
+        ``sign`` selects the end (+1 / -1); grasps are NOT optimized, so this pairing is final.
+        """
+        spheres = self.world.get_collision_spheres(obj)  # (n, 4), object frame
+        lo = (spheres[:, :3] - spheres[:, 3:4]).min(dim=0).values
+        hi = (spheres[:, :3] + spheres[:, 3:4]).max(dim=0).values
+        extents = (hi - lo)[:2]
+        axis = int(extents.argmax())
+        # Back off by the pad's own half-width so the jaws still close on solid material.
+        reach = max(float(extents[axis]) / 2 - _HANDOVER_END_MARGIN, 0.0)
+        n = grasps.shape[0]
+        offset = sign * reach * torch.empty(
+            n, device=grasps.device, dtype=grasps.dtype
+        ).uniform_(*_HANDOVER_END_FRACTION)
+        grasps = grasps.clone()
+        if is_mat4x4:
+            grasps[:, axis, 3] += offset
+        else:
+            grasps[:, axis] += offset
+        return grasps, axis, reach
 
     def __call__(self, plan_skeleton: PlanSkeleton, verbose: bool = True) -> Optional[Particles]:
         config = self.config
@@ -121,68 +348,8 @@ class ParticleInitializer:
                     particles[f"{grasp}_confidences"] = self.pick_cache[obj]["confidences"]
                     continue
 
-                # Sample grasps
                 obj_curobo = world.get_object(obj)
-                num_faces = 4 if isinstance(obj_curobo, Cuboid) else None
-                obj_spheres = world.get_collision_spheres(obj)
-                num_samples = num_particles * 2  # oversample at first
-                sampled_confs = None
-                is_mat4x4 = False
-
-                if config.m2t2_grasps and self.grasps and len(self.grasps[obj]["grasps_obj"]) > 0:
-                    _log.debug(f"Using M2T2 grasps for {obj}")
-                    provided_grasps = self.grasps[obj]["grasps_obj"]
-                    confs = self.grasps[obj]["confidences_pt"]
-                    # Sample randomly with replacement if needed
-                    sample_idxs = torch.randint(
-                        0, provided_grasps.shape[0], (num_samples,), device=provided_grasps.device
-                    )
-                    sampled_grasps = provided_grasps[sample_idxs]
-                    sampled_confs = confs[sample_idxs]
-                    obj_from_grasp = sampled_grasps
-                    is_mat4x4 = True
-                elif config.grasp_dof == 4:
-                    _log.debug(f"Falling back to 4-DOF heuristic grasps for {obj}")
-                    sampled_grasps = grasp_4dof_sampler(num_samples, obj_curobo, obj_spheres, num_faces=num_faces)
-                    obj_from_grasp = action_4dof_to_mat4x4(sampled_grasps)
-                else:
-                    _log.debug(f"Falling back to 6-DOF heuristic grasps for {obj}")
-                    sampled_grasps = grasp_6dof_sampler(num_samples, obj_curobo, num_faces=num_faces)
-                    obj_from_grasp = action_6dof_to_mat4x4(sampled_grasps)
-
-                # Filter grasps by collision with object
-                grasp_spheres = transform_spheres(world.robot_container.gripper_spheres, obj_from_grasp)
-                grasp_coll = sphere_to_sphere_overlap(obj_spheres, grasp_spheres, activation_distance=0.0)
-
-                # Select grasps: use collision-free only, or fall back to lowest collision
-                collision_free_mask = grasp_coll <= 1e-2
-                if collision_free_mask.any():
-                    # Use only collision-free grasps, sorted by confidence if available
-                    cfree_grasps = sampled_grasps[collision_free_mask]
-
-                    if sampled_confs is not None:
-                        cfree_confs = sampled_confs[collision_free_mask]
-                        sort_idxs = torch.argsort(cfree_confs, descending=True)[:num_particles]
-                        selected_grasps = cfree_grasps[sort_idxs]
-                        selected_confs = cfree_confs[sort_idxs]
-                    else:
-                        selected_grasps = cfree_grasps[:num_particles]
-                        selected_confs = None
-                else:
-                    # No collision-free grasps, take lowest collision scores
-                    best_idxs = grasp_coll.topk(num_particles, largest=False).indices
-                    selected_grasps = sampled_grasps[best_idxs]
-                    selected_confs = sampled_confs[best_idxs] if sampled_confs is not None else None
-
-                # Sample with replacement if we don't have enough grasps
-                if selected_grasps.shape[0] < num_particles:
-                    sample_idxs = torch.randint(
-                        0, selected_grasps.shape[0], (num_particles,), device=selected_grasps.device
-                    )
-                    selected_grasps = selected_grasps[sample_idxs]
-                    if selected_confs is not None:
-                        selected_confs = selected_confs[sample_idxs]
-
+                selected_grasps, selected_confs, is_mat4x4 = self._sample_grasps(obj, num_particles)
                 particles[grasp] = selected_grasps
                 particles[f"{grasp}_confidences"] = selected_confs
 
@@ -483,6 +650,210 @@ class ParticleInitializer:
                     }
 
             # Unknown
+            # PickBoth -- both hands grasp a different object at ONE shared configuration
+            elif op_name == PickBoth.name:
+                obj_a, grasp_a, obj_b, grasp_b, q = params
+                arm_to_ee = {}
+                for spec, obj, grasp in zip(world.arms, (obj_a, obj_b), (grasp_a, grasp_b)):
+                    if not world.has_object(obj):
+                        raise ValueError(f"{obj=} not found in world")
+                    if grasp in particles:
+                        raise ValueError(f"{grasp=} shouldn't already be bound")
+                    sel, confs, is_mat4x4 = self._sample_grasps(obj, num_particles)
+                    particles[grasp] = sel
+                    particles[f"{grasp}_confidences"] = confs
+
+                    obj_from_grasp = sel
+                    if not is_mat4x4:
+                        obj_from_grasp = (
+                            action_4dof_to_mat4x4(obj_from_grasp)
+                            if config.grasp_dof == 4
+                            else action_6dof_to_mat4x4(obj_from_grasp)
+                        )
+                    world_from_obj = pose_list_to_mat4x4(world.get_object(obj).pose).to(world.tensor_args.device)
+                    arm_to_ee[spec.name] = world_from_obj @ obj_from_grasp @ spec.tool_from_ee
+                if q in particles:
+                    raise ValueError(f"{q=} shouldn't already be bound")
+                particles[q], _ = self._seed_dual_conf(arm_to_ee, num_particles, header, log_debug)
+                deferred_params.remove(q)
+
+            # MoveHoldingBoth -- same deferral as MoveFree/MoveHolding, for two held objects
+            elif op_name == MoveHoldingBoth.name:
+                obj_a, grasp_a, obj_b, grasp_b, q_start, _traj, q_end = params
+                for obj, grasp in ((obj_a, grasp_a), (obj_b, grasp_b)):
+                    if not world.has_object(obj):
+                        raise ValueError(f"{obj=} not found in world")
+                    if grasp not in particles:
+                        raise ValueError(f"{grasp=} should already be bound")
+                if q_start not in particles:
+                    raise ValueError(f"{q_start=} should already be bound")
+                deferred_params.add(q_end)
+                log_debug(f"{header}. Deferred {q_end}")
+
+            # PlaceBoth -- both hands release at ONE shared configuration
+            elif op_name == PlaceBoth.name:
+                obj_a, grasp_a, place_a, surf_a, obj_b, grasp_b, place_b, surf_b, q = params
+                arm_to_ee = {}
+                for spec, obj, grasp, placement, surface in zip(
+                    world.arms, (obj_a, obj_b), (grasp_a, grasp_b), (place_a, place_b), (surf_a, surf_b)
+                ):
+                    if grasp not in particles:
+                        raise ValueError(f"{grasp=} should already be bound")
+                    if placement in particles:
+                        raise ValueError(f"{placement=} shouldn't already be bound")
+                    if not world.has_object(surface):
+                        raise ValueError(f"{surface=} not found in world")
+
+                    obj_spheres = world.get_collision_spheres(obj)
+                    sampled_placements = place_4dof_sampler(
+                        num_particles * 2,
+                        world.get_object(obj),
+                        obj_spheres,
+                        world.get_object(surface),
+                        surface_rep=config.placement_check,
+                        shrink_dist=config.placement_shrink_dist,
+                        collision_activation_dist=config.world_activation_distance,
+                    )
+                    world_from_obj = action_4dof_to_mat4x4(sampled_placements)
+                    place_coll = world.collision_fn(
+                        transform_spheres(obj_spheres, world_from_obj)[:, None].contiguous()
+                    )[:, 0]
+                    best = place_coll.topk(num_particles, largest=False).indices
+                    particles[placement] = sampled_placements[best]
+
+                    obj_from_grasp = particles[grasp]
+                    if obj_from_grasp.shape[1:3] != (4, 4):
+                        obj_from_grasp = (
+                            action_4dof_to_mat4x4(obj_from_grasp)
+                            if config.grasp_dof == 4
+                            else action_6dof_to_mat4x4(obj_from_grasp)
+                        )
+                    arm_to_ee[spec.name] = world_from_obj[best] @ obj_from_grasp @ spec.tool_from_ee
+                if q in particles:
+                    raise ValueError(f"{q=} shouldn't already be bound")
+                particles[q], _ = self._seed_dual_conf(arm_to_ee, num_particles, header, log_debug)
+                deferred_params.remove(q)
+
+            # PickGiver -- only the giver arm reaches; the taker parks.
+            elif op_name == PickGiver.name:
+                obj, grasp, q = params
+                if not world.has_object(obj):
+                    raise ValueError(f"{obj=} not found in world")
+                giver = world.arms[0]
+                sel, confs_, is_mat4x4 = self._sample_grasps(obj, num_particles)
+                # The giver takes the +end of the object so the taker can have the -end.
+                sel, _axis, _reach = self._slide_grasps_to_end(sel, is_mat4x4, obj, +1.0)
+                particles[grasp] = sel
+                particles[f"{grasp}_confidences"] = confs_
+                obj_from_grasp = sel if is_mat4x4 else (
+                    action_4dof_to_mat4x4(sel) if config.grasp_dof == 4 else action_6dof_to_mat4x4(sel)
+                )
+                world_from_obj = pose_list_to_mat4x4(world.get_object(obj).pose).to(world.tensor_args.device)
+                particles[q], _ = self._seed_dual_conf(
+                    {giver.name: world_from_obj @ obj_from_grasp @ giver.tool_from_ee},
+                    num_particles, header, log_debug,
+                )
+                deferred_params.remove(q)
+
+            elif op_name in (MoveHoldingGiver.name, MoveHoldingTaker.name):
+                obj, grasp, q_start, _traj, q_end = params
+                if grasp not in particles:
+                    raise ValueError(f"{grasp=} should already be bound")
+                if q_start not in particles:
+                    raise ValueError(f"{q_start=} should already be bound")
+                deferred_params.add(q_end)
+                log_debug(f"{header}. Deferred {q_end}")
+
+            # Handover -- both hands meet on one object at a free mid-air pose.
+            elif op_name == Handover.name:
+                obj, grasp_g, grasp_t, hand_pose, q = params
+                if grasp_g not in particles:
+                    raise ValueError(f"{grasp_g=} should already be bound")
+                giver, taker = world.arms[0], world.arms[1]
+
+                # The taker's grasp must be FAR ALONG THE OBJECT from the giver's, or the two hands
+                # occupy the same space: two 10 cm YAM grippers on one 5 cm cube leave ~1 mm of arm
+                # clearance, while a 22 cm bar grasped at opposite ends leaves ~127 mm. Grasps are
+                # NOT optimized (only Pose and Conf are), so a badly-paired sample can never be
+                # repaired later -- hence choosing the separation here. Every candidate is first slid
+                # to the object's -end (the giver holds the +end), then the farthest one is kept, which
+                # is what actually separates real M2T2 grasps.
+                cand, cand_confs, cand_mat = self._sample_grasps(obj, num_particles * 8)
+                cand, axis, reach = self._slide_grasps_to_end(cand, cand_mat, obj, -1.0)
+                cand_mat4 = cand if cand_mat else (
+                    action_4dof_to_mat4x4(cand) if config.grasp_dof == 4 else action_6dof_to_mat4x4(cand)
+                )
+                giver_mat4 = particles[grasp_g]
+                if giver_mat4.shape[1:3] != (4, 4):
+                    giver_mat4 = (action_4dof_to_mat4x4(giver_mat4) if config.grasp_dof == 4
+                                  else action_6dof_to_mat4x4(giver_mat4))
+                # distance between grasp origins in the OBJECT frame, per (particle, candidate)
+                sep = torch.cdist(giver_mat4[:, :3, 3], cand_mat4[:, :3, 3])       # (n, 8n)
+                best = sep.argmax(dim=1)
+                particles[grasp_t] = cand[best]
+                particles[f"{grasp_t}_confidences"] = None if cand_confs is None else cand_confs[best]
+                taker_mat4 = cand_mat4[best]
+                log_debug(f"{header}. hands on object axis {axis} (usable half-length "
+                          f"{reach * 100:.1f} cm). taker grasp separation: "
+                          f"min {float(sep.gather(1, best[:, None]).min()) * 100:.1f} cm, "
+                          f"median {float(sep.gather(1, best[:, None]).median()) * 100:.1f} cm")
+
+                # The handover pose is a free 4-DOF object pose in MID-AIR: sampled in a box above
+                # the table between the two shoulders, where the feasibility sweep found both arms can
+                # reach without their upper arms intersecting.
+                if hand_pose in particles:
+                    raise ValueError(f"{hand_pose=} shouldn't already be bound")
+                lo, hi = world.handover_region
+                xyz = sample_between_bounds(num_particles, torch.stack([lo, hi]))
+                yaw = sample_yaw(num_particles, None, world.tensor_args.device)
+                # The giver holds the object's +axis end, so in mid-air that end has to point to the
+                # giver's OWN side of the robot -- otherwise the arms must cross, which is never
+                # collision-free. A uniform yaw gets this wrong half the time, and adding pi fixes
+                # exactly those samples without changing the object's tilt.
+                giver_side = world.arm_side_signs[giver.name]
+                axis_world_y = torch.sin(yaw) if axis == 0 else torch.cos(yaw)
+                yaw = torch.where(axis_world_y * giver_side < 0, yaw + torch.pi, yaw)
+                particles[hand_pose] = torch.cat([xyz, yaw.unsqueeze(-1)], dim=1)
+                world_from_obj = action_4dof_to_mat4x4(particles[hand_pose])
+
+                particles[q], _ = self._seed_dual_conf(
+                    {giver.name: world_from_obj @ giver_mat4 @ giver.tool_from_ee,
+                     taker.name: world_from_obj @ taker_mat4 @ taker.tool_from_ee},
+                    num_particles, header, log_debug,
+                )
+                deferred_params.remove(q)
+
+            # PlaceTaker -- only the taker arm reaches; the giver parks.
+            elif op_name == PlaceTaker.name:
+                obj, grasp, placement, surface, q = params
+                if grasp not in particles:
+                    raise ValueError(f"{grasp=} should already be bound")
+                if not world.has_object(surface):
+                    raise ValueError(f"{surface=} not found in world")
+                taker = world.arms[1]
+                obj_spheres = world.get_collision_spheres(obj)
+                sampled = place_4dof_sampler(
+                    num_particles * 2, world.get_object(obj), obj_spheres, world.get_object(surface),
+                    surface_rep=config.placement_check, shrink_dist=config.placement_shrink_dist,
+                    collision_activation_dist=config.world_activation_distance,
+                )
+                world_from_obj = action_4dof_to_mat4x4(sampled)
+                coll = world.collision_fn(
+                    transform_spheres(obj_spheres, world_from_obj)[:, None].contiguous()
+                )[:, 0]
+                best = coll.topk(num_particles, largest=False).indices
+                particles[placement] = sampled[best]
+
+                obj_from_grasp = particles[grasp]
+                if obj_from_grasp.shape[1:3] != (4, 4):
+                    obj_from_grasp = (action_4dof_to_mat4x4(obj_from_grasp) if config.grasp_dof == 4
+                                      else action_6dof_to_mat4x4(obj_from_grasp))
+                particles[q], _ = self._seed_dual_conf(
+                    {taker.name: world_from_obj[best] @ obj_from_grasp @ taker.tool_from_ee},
+                    num_particles, header, log_debug,
+                )
+                deferred_params.remove(q)
+
             else:
                 raise NotImplementedError(f"Unsupported operator {op_name}")
 
