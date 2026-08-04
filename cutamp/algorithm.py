@@ -445,8 +445,23 @@ def run_cutamp(
     grasps: Optional[dict] = None,
     motion_gen: Optional[MotionGen] = None,
     experiment_dir: Optional[Path] = None,
+    reuse_plan_skeleton: Optional[PlanSkeleton] = None,
+    plan_out: Optional[dict] = None,
 ):
-    """Overall cuTAMP algorithm implementation."""
+    """Overall cuTAMP algorithm implementation.
+
+    ``reuse_plan_skeleton`` fixes the task plan instead of searching for one: the symbolic search is
+    skipped and the given skeleton is the only one considered, while its continuous parameters
+    (grasps, placements) and cuRobo trajectories are solved from scratch against THIS world. A
+    ground operator carries only its operator and object-name strings, so a skeleton from an earlier
+    call is reusable here as-is -- but it is the caller's job to check it still applies to this
+    world's initial state (its object names may not even exist here). Nothing validates it below;
+    an inapplicable skeleton simply fails to produce satisfying particles and returns no plan.
+
+    ``plan_out``, if given, is filled in with {"plan_skeleton": ...} -- the skeleton behind the
+    returned plan, so a caller can feed it back in later. Returned this way rather than in the
+    return tuple, which callers unpack positionally.
+    """
     if config.m2t2_grasps and not grasps:
         _log.warning(f"M2T2 grasps enabled but no grasps provided! Falling back to grasp_dof={config.grasp_dof}")
 
@@ -458,12 +473,18 @@ def run_cutamp(
     _log.info(f"Initial State: {world.initial_state}")
     _log.info(f"Goal State: {world.goal_state}")
     with timer.time("get_plan_generator", log_callback=_log.info):
-        plan_gen = task_plan_generator(
-            world.initial_state,
-            world.goal_state,
-            operators=all_tamp_operators,
-            explored_state_check=config.explored_state_check,
-        )
+        if reuse_plan_skeleton is not None:
+            # Reusing a task plan: yield exactly that skeleton, then run dry. The sampling loop below
+            # takes the StopIteration as "ran out of plans" and moves on to optimizing the one it got.
+            _log.info(f"Reusing the given task plan, skipping the symbolic search: {[op.name for op in reuse_plan_skeleton]}")
+            plan_gen = iter([reuse_plan_skeleton])
+        else:
+            plan_gen = task_plan_generator(
+                world.initial_state,
+                world.goal_state,
+                operators=all_tamp_operators,
+                explored_state_check=config.explored_state_check,
+            )
 
     # Sample initial plans and particles
     found_solution_initially = False
@@ -785,4 +806,9 @@ def run_cutamp(
     # Log constraint and cost multipliers
     exp_logger.log_dict("multipliers", cost_reducer.cost_config)
     exp_logger.log_dict("tolerances", constraint_checker.constraint_config)
+    # Hand back the skeleton behind the plan we're returning, so a caller can reuse it (see
+    # reuse_plan_skeleton). Only on success: a skeleton whose motion planning failed is not one to
+    # feed back in. overall_metrics keeps its own str() copy for the logs, which is not re-groundable.
+    if plan_out is not None:
+        plan_out["plan_skeleton"] = final_plan_skeleton if curobo_plan is not None else None
     return curobo_plan, overall_metrics["num_satisfying_final"], failure_reason
