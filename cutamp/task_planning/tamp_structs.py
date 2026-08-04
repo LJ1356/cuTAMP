@@ -22,9 +22,17 @@ _GROUND_OP_CACHE: dict[tuple, "GroundTAMPOperator"] = {}
 class TAMPOperator(Operator):
     constraints: Sequence["Constraint"] = field(default_factory=tuple)
     costs: Sequence["Cost"] = field(default_factory=tuple)
+    # Parameter-name pairs that must bind to DIFFERENT objects. Preconditions cannot express
+    # inequality, so without this a two-object operator grounds with both hands on one object.
+    # Empty for every single-arm operator, where the search behaviour is therefore unchanged.
+    distinct_params: Sequence[tuple] = field(default_factory=tuple)
 
     def ground(self, substitutions: dict[str, str]) -> "GroundTAMPOperator":
-        cache_key = tuple(sorted(substitutions.items()))
+        # Keyed on the operator NAME as well as the substitution: the map alone is ambiguous the
+        # moment two operators share a parameter-name set, which would silently return the wrong
+        # grounded operator. Today's single-arm operators have pairwise-distinct parameter names, so
+        # adding the name cannot split or merge any existing cache entry.
+        cache_key = (self.name, tuple(sorted(substitutions.items())))
         if cache_key not in _GROUND_OP_CACHE:
             ground_operator: GroundOperator = super().ground(substitutions)
             # Ground constraints and costs

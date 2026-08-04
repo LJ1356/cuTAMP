@@ -26,6 +26,7 @@ from cutamp.robots import RobotContainer, load_robot_container
 from cutamp.robots.franka_robotiq import get_fr3_robotiq_ik_solver, fr3_robotiq_curobo_cfg
 from cutamp.robots.franka import franka_curobo_cfg, get_franka_ik_solver, get_fr3_franka_ik_solver, fr3_franka_curobo_cfg
 from cutamp.robots.ur5 import ur5_curobo_cfg, get_ur5_ik_solver
+from cutamp.robots.bimanual_yam import bimanual_yam_curobo_cfg, get_bimanual_yam_ik_solver
 from cutamp.tamp_domain import get_initial_state
 from cutamp.task_planning import State
 from cutamp.utils.collision import get_world_collision_cost
@@ -88,8 +89,21 @@ class TAMPWorld:
             self.ik_solver = get_fr3_franka_ik_solver(self.world_cfg)
         elif self.robot_name == "ur5":
             self.ik_solver = get_ur5_ik_solver(self.world_cfg)
+        elif self.robot_name.startswith("bimanual_yam_"):
+            self.ik_solver = get_bimanual_yam_ik_solver(self.world_cfg, self.robot_name.rsplit("_", 1)[1])
         else:
             raise ValueError(f"Unsupported robot: {self.robot_name}")
+
+        # Per-arm IK solvers, only for a multi-arm container. Dual-arm configurations are SEEDED by
+        # solving each arm's 6-DOF IK independently against its own single-arm cuRobo config and
+        # scattering the two solutions into the 12-vector's column slices -- verified to reproduce
+        # both target poses through the dual forward kinematics to <1e-5. cuRobo has no API for a
+        # simultaneous two-pose IK, and cuTAMP does not need one: these are only initial particles,
+        # and the optimizer refines them against the dual kinematic cost.
+        self.ik_solvers: Dict[str, IKSolver] = {}
+        if self.robot_container.is_multi_arm:
+            for spec in self.robot_container.arms:
+                self.ik_solvers[spec.name] = get_bimanual_yam_ik_solver(self.world_cfg, spec.name)
 
         # Sample collision spheres for all movables
         self._obj_to_spheres: Dict[str, Float[torch.Tensor, "n 4"]] = {}
@@ -116,6 +130,40 @@ class TAMPWorld:
     @property
     def kin_model(self) -> CudaRobotModel:
         return self.robot_container.kin_model
+
+    @property
+    def handover_region(self):
+        """(lo, hi) xyz box, in the world frame, where a two-handed exchange may happen.
+
+        Mid-air between the two shoulders and above the table: an IK sweep over this box found the
+        two arms can both reach an object there without their upper arms intersecting. Derived from
+        the arm mounts rather than hard-coded so it follows the robot if the base pose changes.
+        """
+        base = self.kin_model.get_state(
+            torch.zeros((1, self.robot_container.joint_limits.shape[1]), device=self.device)
+        )
+        # Midpoint between the hands at the zero configuration fixes x and y; z spans a band above
+        # the table that both arms can reach.
+        mid = torch.stack([base.link_pose[a.ee_link].position[0] for a in self.arms]).mean(dim=0)
+        lo = torch.tensor([float(mid[0]) - 0.08, float(mid[1]) - 0.05, 0.18], device=self.device)
+        hi = torch.tensor([float(mid[0]) + 0.14, float(mid[1]) + 0.05, 0.34], device=self.device)
+        return lo, hi
+
+    @property
+    def arm_side_signs(self) -> dict:
+        """Sign of each arm's world y at the zero configuration: which side of the robot it works on."""
+        base = self.kin_model.get_state(
+            torch.zeros((1, self.robot_container.joint_limits.shape[1]), device=self.device)
+        )
+        return {
+            a.name: 1.0 if float(base.link_pose[a.ee_link].position[0][1]) >= 0 else -1.0
+            for a in self.arms
+        }
+
+    @property
+    def arms(self) -> tuple:
+        """Per-arm specs, or () for a single-arm robot. Non-empty selects every dual-arm code path."""
+        return self.robot_container.arms
 
     @property
     def tool_from_ee(self) -> Float[torch.Tensor, "4 4"]:
@@ -211,12 +259,23 @@ class TAMPWorld:
             robot_cfg = fr3_franka_curobo_cfg()
         elif self.robot_name == "ur5":
             robot_cfg = ur5_curobo_cfg()
+        elif self.robot_name.startswith("bimanual_yam_"):
+            robot_cfg = bimanual_yam_curobo_cfg(self.robot_name.rsplit("_", 1)[1])
         else:
             raise ValueError(f"Unsupported robot: {self.robot_name}")
 
+        # Size EVERY attached-object slot to the largest object sphere set. A multi-arm config
+        # declares one slot per hand (left_attached_object / right_attached_object), so writing only
+        # the single-arm "attached_object" key would leave those at their declared placeholder size
+        # and attach_objects_to_robot would fail trying to fit 50 spheres into 4.
         max_num_spheres = max([len(sphs) for sphs in self._obj_to_spheres.values()])
-        robot_cfg["robot_cfg"]["kinematics"]["extra_collision_spheres"]["attached_object"] = max_num_spheres
-        _log.info(f"Setting number of spheres for attachments to {max_num_spheres}")
+        extra_spheres = robot_cfg["robot_cfg"]["kinematics"]["extra_collision_spheres"]
+        for link_name in extra_spheres:
+            extra_spheres[link_name] = max_num_spheres
+        _log.info(
+            f"Setting number of spheres for attachments to {max_num_spheres} "
+            f"on {sorted(extra_spheres)}"
+        )
 
         # World config needs to include movables for cuRobo
         world_cfg = get_world_cfg(self.env, include_movables=True)

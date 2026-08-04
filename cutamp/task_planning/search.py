@@ -212,6 +212,14 @@ def get_valid_ground_operators(
         combinations = list(itertools.product(*param_to_literals.values()))
         for combo in combinations:
             substitutions = dict(zip(param_names, combo))
+            # Reject bindings that put two parameters on the same object (e.g. both hands grasping
+            # one cube). `any()` over the empty default is False, so single-arm operators are
+            # unaffected -- preconditions cannot express inequality, hence this hook.
+            if any(
+                substitutions[x] == substitutions[y]
+                for x, y in getattr(operator, "distinct_params", ())
+            ):
+                continue
             ground_op = operator.ground(substitutions)
 
             # Check preconditions are satisfied for this specific parameter combination

@@ -8,6 +8,7 @@
 # its affiliates is strictly prohibited.
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Sequence
 
 import roma
@@ -41,7 +42,41 @@ from .franka_robotiq import (
     get_panda_robotiq_ik_solver,
 )
 from .ur5 import load_ur5_rerun, ur5_home, get_ur5_gripper_spheres, get_ur5_ik_solver, get_ur5_kinematics_model
+from .bimanual_yam import (
+    ARMS as YAM_ARMS,
+    DUAL as YAM_DUAL,
+    DUAL_JOINT_SLICES as YAM_DUAL_JOINT_SLICES,
+    Arm,
+    bimanual_yam_curobo_cfg,
+    bimanual_yam_neutral_joint_positions,
+    get_bimanual_yam_gripper_spheres,
+    get_bimanual_yam_ik_solver,
+    get_bimanual_yam_kinematics_model,
+    load_bimanual_yam_rerun,
+    yam_arm_joints,
+    yam_attached_link,
+    yam_ee_link,
+    yam_tool_from_ee,
+)
 from .utils import RerunRobot
+
+
+@dataclass(frozen=True)
+class ArmSpec:
+    """One arm of a multi-arm robot, for containers whose configuration spans several arms.
+
+    ``ee_link`` must be present in the cuRobo config's ``link_names`` so that a single
+    ``kin_model.get_state(q)`` returns every arm's pose at once -- that is what allows ONE
+    configuration to be constrained at several hands simultaneously.
+    """
+
+    name: str                                        # "left" / "right"
+    ee_link: str                                     # cuRobo link this arm's grasps are compared to
+    joint_slice: slice                               # this arm's columns within a configuration
+    tool_from_ee: Float[torch.Tensor, "4 4"]
+    gripper_spheres: Float[torch.Tensor, "n 4"]
+    attached_link: str = "attached_object"           # cuRobo link this hand's grasped object attaches to
+    link_index: int = 0                              # index of ee_link within kin_model.link_names
 
 
 @dataclass(frozen=True)
@@ -53,6 +88,25 @@ class RobotContainer:
     gripper_spheres: Float[torch.Tensor, "n 4"]
     # Transformation from tool pose to end-effector (defined in cuRobo config)
     tool_from_ee: Float[torch.Tensor, "4 4"]
+    # Per-arm specs for a multi-arm container. EMPTY for every single-arm robot, which is what keeps
+    # the single-arm code paths (and the `tool_from_ee` / `gripper_spheres` fields above) untouched.
+    arms: tuple = ()
+
+    @property
+    def is_multi_arm(self) -> bool:
+        return len(self.arms) > 1
+
+    @property
+    def arm_link_indices(self) -> Float[torch.Tensor, "a"]:
+        """Row indices into ``kin_model.get_state(q).links_position`` for each arm's ee_link."""
+        return torch.as_tensor([a.link_index for a in self.arms], dtype=torch.long,
+                               device=self.kin_model.tensor_args.device)
+
+    def arm(self, name: str) -> "ArmSpec":
+        for spec in self.arms:
+            if spec.name == name:
+                return spec
+        raise KeyError(f"{self.name} has no arm {name!r}; known: {[a.name for a in self.arms]}")
 
 
 def load_panda_container(tensor_args: TensorDeviceType) -> RobotContainer:
@@ -125,6 +179,61 @@ def load_ur5_container(tensor_args: TensorDeviceType) -> RobotContainer:
     return RobotContainer("ur5", kin_model, joint_limits, gripper_spheres, tool_from_ee)
 
 
+def load_bimanual_yam_dual_container(tensor_args: TensorDeviceType) -> RobotContainer:
+    """Container driving BOTH YAM arms as one 12-DOF chain, for simultaneous dual-arm plans.
+
+    The two arms share their gripper geometry and their tool frame (the hands are identical, just
+    mirrored in placement), so the per-arm specs differ only in which cuRobo link the arm's grasps
+    are compared against and which 6 columns of a configuration belong to it. ``tool_from_ee`` and
+    ``gripper_spheres`` at the top level mirror the LEFT arm so that any code reaching for the
+    single-arm fields still gets something meaningful.
+    """
+    kin_model = get_bimanual_yam_kinematics_model(YAM_DUAL)
+    joint_limits = kin_model.kinematics_config.joint_limits.position
+    assert joint_limits.shape == (2, 12), f"Invalid joint limits shape: {joint_limits.shape}"
+
+    tool_from_ee = yam_tool_from_ee(tensor_args)
+    link_names = list(kin_model.link_names)
+    joint_names = list(kin_model.joint_names)
+    arms = tuple(
+        ArmSpec(
+            name=name,
+            ee_link=yam_ee_link(name),
+            joint_slice=YAM_DUAL_JOINT_SLICES[name],
+            tool_from_ee=tool_from_ee,
+            gripper_spheres=get_bimanual_yam_gripper_spheres(name, tensor_args),
+            attached_link=yam_attached_link(name),
+            # Looked up, never assumed from declaration order: this index selects the arm's row out
+            # of the stacked link poses, so getting it wrong silently controls the wrong hand.
+            link_index=link_names.index(yam_ee_link(name)),
+        )
+        for name in YAM_ARMS
+    )
+    for spec in arms:
+        assert joint_names[spec.joint_slice] == yam_arm_joints(spec.name), (
+            f"{spec.name} joint slice {spec.joint_slice} maps to {joint_names[spec.joint_slice]}")
+        assert link_names[spec.link_index] == spec.ee_link
+        # `link_names` is only the TRACKED links; extra_links live in the kinematics link map.
+        assert spec.attached_link in kin_model.kinematics_config.link_name_to_idx_map, (
+            f"{spec.attached_link} missing from the dual cuRobo config's extra_links")
+    return RobotContainer(
+        "bimanual_yam_dual", kin_model, joint_limits, arms[0].gripper_spheres, tool_from_ee, arms=arms
+    )
+
+
+def load_bimanual_yam_container(arm: Arm, tensor_args: TensorDeviceType) -> RobotContainer:
+    """Container for one YAM arm; the other arm and both grippers are locked (see bimanual_yam.py)."""
+    kin_model = get_bimanual_yam_kinematics_model(arm)
+    joint_limits = kin_model.kinematics_config.joint_limits.position
+    assert joint_limits.shape == (2, 6), f"Invalid joint limits shape: {joint_limits.shape}"
+
+    gripper_spheres = get_bimanual_yam_gripper_spheres(arm, tensor_args)
+    # Defined next to the gripper spheres (which are expressed in the frame it defines) rather than
+    # inline here, so the two cannot drift apart.
+    tool_from_ee = yam_tool_from_ee(tensor_args)
+    return RobotContainer(f"bimanual_yam_{arm}", kin_model, joint_limits, gripper_spheres, tool_from_ee)
+
+
 robot_to_fns = {
     "panda": {
         "rerun": load_franka_rerun,
@@ -150,6 +259,22 @@ robot_to_fns = {
         "rerun": load_ur5_rerun,
         "q_home": ur5_home[:6],
         "container": load_ur5_container,
+    },
+    # The bimanual YAM registers once per arm: cuTAMP plans a single chain, so which arm is active
+    # is baked into the cuRobo config (ee_link + lock_joints) and therefore into the robot id.
+    **{
+        f"bimanual_yam_{arm}": {
+            "rerun": partial(load_bimanual_yam_rerun, arm),
+            "q_home": bimanual_yam_neutral_joint_positions,
+            "container": partial(load_bimanual_yam_container, arm),
+        }
+        for arm in YAM_ARMS
+    },
+    # Both arms at once, as a single 12-DOF chain. See load_bimanual_yam_dual_container.
+    "bimanual_yam_dual": {
+        "rerun": partial(load_bimanual_yam_rerun, "left"),
+        "q_home": tuple(bimanual_yam_neutral_joint_positions) * 2,
+        "container": load_bimanual_yam_dual_container,
     },
 }
 
