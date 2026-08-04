@@ -34,6 +34,14 @@ class TAMPConfiguration:
     #   "handover" -- asymmetric: one hand picks, both hands meet on the object, the other carries on.
     dual_task: Literal["parallel", "handover"] = "parallel"
 
+    # Resting configuration the final segment of a motion plan returns the arm to. When None, that
+    # segment targets q0 -- this plan's own starting configuration -- which is only "home" if
+    # something put the arm there before planning. A caller that plans from an arbitrary starting
+    # pose (a robot picking up a task mid-way, say) should give the embodiment's actual home here,
+    # or every trajectory for the plan fails together the moment q0 is unreachable from the end of
+    # it. Must have one entry per planned joint. A tuple, so the frozen config stays hashable.
+    q_home: Optional[tuple[float, ...]] = None
+
     # Grasp and Placements
     grasp_dof: Literal[4, 6] = 4
     place_dof: Literal[4] = 4

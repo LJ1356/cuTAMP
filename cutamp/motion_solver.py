@@ -423,9 +423,19 @@ def solve_curobo(
     last_js = JointState.from_position(plan[-1:].position)
     ts = visualizer.log_joint_trajectory(plan.position, timeline=timeline, start_time=ts, dt=dt)
 
-    # Plan to go home at the end which we'll assume is q0
+    # Plan to go home at the end. `config.q_home` when the caller named one, else q0 -- this plan's
+    # own starting configuration, which is only "home" if something put the arm there beforehand.
+    # The distinction matters because this target is the SAME for every particle: when it cannot be
+    # reached, no particle's trajectory can complete, and the whole plan fails at once.
     q_last = last_js.position[0]
-    q_home = best_particle["q0"].clone()
+    if config.q_home is not None:
+        if len(config.q_home) != q_last.shape[0]:
+            raise ValueError(
+                f"config.q_home has {len(config.q_home)} joints but the robot has {q_last.shape[0]}"
+            )
+        q_home = torch.tensor(config.q_home, dtype=q_last.dtype, device=q_last.device)
+    else:
+        q_home = best_particle["q0"].clone()
     js_last = JointState.from_position(q_last[None])
     js_home = JointState.from_position(q_home[None])
     with timer.time(f"{timeline}_planning"):
