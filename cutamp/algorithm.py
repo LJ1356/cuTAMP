@@ -519,6 +519,7 @@ def run_cutamp(
     _log.info(f"Num plans: {len(plan_queue)}, num skipped: {num_skipped_plans}")
 
     curobo_plan = None
+    curobo_plan_skeleton = None  # the skeleton curobo_plan came from; see plan_out
     failure_reason = None
     overall_metrics = {
         "num_optimized_plans": 0,
@@ -716,6 +717,10 @@ def run_cutamp(
                         )
                         _log.info("Successful plan found!")
                         failure_reason = None
+                        # Pin the skeleton this plan came from. final_plan_skeleton below advances
+                        # with the loop, and curobo_plan is never cleared once set, so with
+                        # break_on_satisfying off the two can end up describing different skeletons.
+                        curobo_plan_skeleton = plan_skeleton
                         break
                     except MotionPlanningError as e:
                         _log.warning(f"Failed to motion plan: {e}")
@@ -810,5 +815,5 @@ def run_cutamp(
     # reuse_plan_skeleton). Only on success: a skeleton whose motion planning failed is not one to
     # feed back in. overall_metrics keeps its own str() copy for the logs, which is not re-groundable.
     if plan_out is not None:
-        plan_out["plan_skeleton"] = final_plan_skeleton if curobo_plan is not None else None
+        plan_out["plan_skeleton"] = curobo_plan_skeleton
     return curobo_plan, overall_metrics["num_satisfying_final"], failure_reason
