@@ -599,7 +599,10 @@ class CostFunction:
         # Robot to world
         robot_spheres = rollout["robot_spheres"]
         with torch.profiler.record_function("coll::robot_to_world"):
-            coll_values = {"robot_to_world": self.world.collision_fn(robot_spheres)}
+            # robot_collision_fn, not collision_fn: the arm is allowed to reach INTO the surfaces
+            # listed in world.pick_transparent (see TAMPWorld). movable_to_world below keeps the
+            # full checker, so a PLACED object is still screened against those surfaces.
+            coll_values = {"robot_to_world": self.world.robot_collision_fn(robot_spheres)}
 
         # Collision between movables and world — batch all activated objects in one collision_fn call,
         # then mask out timesteps before each object's first placement. The motion solver handles this

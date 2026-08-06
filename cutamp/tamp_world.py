@@ -62,8 +62,40 @@ class TAMPWorld:
         self._name_to_obj = {obj.name: obj for obj in env.movables + env.statics}
 
         # Setup collision function
-        self.world_cfg = get_world_cfg(env, include_movables=False)  # doesn't include movables
+        # Surfaces the arm is allowed to reach INTO. Perception reconstructs an open container
+        # (a plate, a bowl) as a mesh whose collision proxy is a filled OBB spanning its full
+        # height, so every object resting in it is embedded in an obstacle. Measured on a scene
+        # reset: with the plate in the world, grasp IK for the three toys was 0/25, 0/1 and
+        # 13/30; with it out, 25/25, 1/1 and 30/30 -- and cuTAMP's own robot_to_world rejected
+        # the pick configurations too (90/256, 82/256, 22/256 against 253-256 elsewhere).
+        #
+        # They are dropped from `reach_world_cfg` only, which feeds the IK solvers and the
+        # robot_to_world cost -- both of which merely CHOOSE WAYPOINTS. Everything that screens
+        # geometry keeps the full `world_cfg`: movable_to_world, and the candidate-placement
+        # filter in particle_initialization, so placing a toy half-on the plate rim is still
+        # rejected on the task path. Placement HEIGHT is untouched either way -- it comes from
+        # _name_to_obj, not from a collision checker. The motion generator also keeps them
+        # (get_motion_gen / algorithm.py build their world off the untouched env), so the
+        # planned path still avoids the container everywhere except the pick and place-retract
+        # legs, where solve_curobo hides them explicitly via _obstacles_hidden.
+        self.pick_transparent = {
+            name for name in getattr(env, "pick_transparent", ()) if name in self._name_to_obj
+        }
+        if self.pick_transparent:
+            _log.info(f"Reach-into surfaces hidden from IK/collision cost: {sorted(self.pick_transparent)}")
+        # doesn't include movables
+        self.world_cfg = get_world_cfg(env, include_movables=False)
         self.collision_fn = get_world_collision_cost(self.world_cfg, tensor_args, collision_activation_distance)
+        # Reach-into variant. Identical to the above when nothing is pick_transparent.
+        self.reach_world_cfg = self.world_cfg
+        self.robot_collision_fn = self.collision_fn
+        if self.pick_transparent:
+            self.reach_world_cfg = get_world_cfg(
+                env, include_movables=False, exclude=self.pick_transparent
+            )
+            self.robot_collision_fn = get_world_collision_cost(
+                self.reach_world_cfg, tensor_args, collision_activation_distance
+            )
         self.collision_activation_distance = collision_activation_distance
 
         # Setup robot container
@@ -78,19 +110,19 @@ class TAMPWorld:
         # Setup the IK solver, right now it needs WorldCfg and I don't know the behavior, can speed up later
         if ik_solver is not None:
             self.ik_solver = ik_solver
-            self.ik_solver.update_world(self.world_cfg)
+            self.ik_solver.update_world(self.reach_world_cfg)
         elif self.robot_name == "panda":
-            self.ik_solver = get_franka_ik_solver(self.world_cfg)
+            self.ik_solver = get_franka_ik_solver(self.reach_world_cfg)
         elif self.robot_name == "panda_robotiq":
-            self.ik_solver = get_franka_ik_solver(self.world_cfg)
+            self.ik_solver = get_franka_ik_solver(self.reach_world_cfg)
         elif self.robot_name == "fr3_robotiq":
-            self.ik_solver = get_fr3_robotiq_ik_solver(self.world_cfg)
+            self.ik_solver = get_fr3_robotiq_ik_solver(self.reach_world_cfg)
         elif self.robot_name == "fr3_franka":
-            self.ik_solver = get_fr3_franka_ik_solver(self.world_cfg)
+            self.ik_solver = get_fr3_franka_ik_solver(self.reach_world_cfg)
         elif self.robot_name == "ur5":
-            self.ik_solver = get_ur5_ik_solver(self.world_cfg)
+            self.ik_solver = get_ur5_ik_solver(self.reach_world_cfg)
         elif self.robot_name.startswith("bimanual_yam_"):
-            self.ik_solver = get_bimanual_yam_ik_solver(self.world_cfg, self.robot_name.rsplit("_", 1)[1])
+            self.ik_solver = get_bimanual_yam_ik_solver(self.reach_world_cfg, self.robot_name.rsplit("_", 1)[1])
         else:
             raise ValueError(f"Unsupported robot: {self.robot_name}")
 
@@ -103,7 +135,7 @@ class TAMPWorld:
         self.ik_solvers: Dict[str, IKSolver] = {}
         if self.robot_container.is_multi_arm:
             for spec in self.robot_container.arms:
-                self.ik_solvers[spec.name] = get_bimanual_yam_ik_solver(self.world_cfg, spec.name)
+                self.ik_solvers[spec.name] = get_bimanual_yam_ik_solver(self.reach_world_cfg, spec.name)
 
         # Sample collision spheres for all movables
         self._obj_to_spheres: Dict[str, Float[torch.Tensor, "n 4"]] = {}
