@@ -186,6 +186,12 @@ class ParticleOptimizer:
                 _log.info(
                     f"Found {num_satisfying} >= {self.num_satisfying_break} ({self.config.prop_satisfying_break * 100:.2f}%) satisfying particles "
                 )
+                # This is the one exit from the loop body that skips the stop() below, and the timer
+                # is shared across the whole run: leaving it started makes the NEXT skeleton's first
+                # step raise "Timer already started for optimization_step". It only bites when a
+                # second skeleton is optimized at all, i.e. when motion refinement failed for the
+                # first -- which is why it surfaced together with the retiming regression.
+                timer.stop("optimization_step")
                 break
 
             opt_metrics["num_satisfying"].append(num_satisfying)
