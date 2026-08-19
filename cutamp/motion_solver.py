@@ -73,10 +73,16 @@ def solve_curobo(
     obj_to_initial_pose: dict[str, torch.Tensor],
     timeline: str = "curobo",
     motion_gen: Optional[MotionGen] = None,
+    q_return: Optional[torch.Tensor] = None,
 ):
     """
     Solve for full motion plan given a plan skeleton and optimized particles.
     Note that visualization adds non-trivial overhead.
+
+    ``q_return`` overrides the configuration the closing GoToInitial drives to. It defaults to q0 --
+    the configuration this plan started from -- which is what a standalone plan wants. A caller that
+    CONCATENATES plans needs the override: the second plan starts wherever the first one handed over,
+    so its q0 is a mid-episode pose, and defaulting would end the episode by driving back to it.
     """
     plan_skeleton = plan_info["plan_skeleton"]
     if motion_gen is None:
@@ -434,7 +440,22 @@ def solve_curobo(
                 interp = torch.linspace(0.02, end_val, 20)[:, None]
                 interp = interp.repeat(1, 2)
             dt = 0.02
-            accum_plans.append({"type": "gripper", "action": "open", "label": ground_op.name})
+            accum_plans.append(
+                {
+                    "type": "gripper",
+                    "action": "open",
+                    "label": ground_op.name,
+                    # Where this Place leaves the object, in world frame. Recorded on the step because
+                    # this is the only point it is known exactly: it is what the collision world is
+                    # updated to on the line above, and it accounts for the approach offsets and the
+                    # attachment transform that a caller reconstructing it from the trajectory's
+                    # kinematics would have to re-derive (and get wrong -- ee_from_obj above is taken
+                    # at the START of this operator, not at the grasp). A consumer that plans a
+                    # FOLLOW-ON problem against the post-plan scene needs exactly this.
+                    "placed_object": obj,
+                    "world_from_obj": obj_pose.detach().cpu().numpy(),
+                }
+            )
 
             all_pos = last_js.position.expand(interp.shape[0], -1).cpu()
             all_pos = torch.cat([all_pos, interp], dim=1)
@@ -472,9 +493,10 @@ def solve_curobo(
     last_js = JointState.from_position(plan[-1:].position)
     ts = visualizer.log_joint_trajectory(plan.position, timeline=timeline, start_time=ts, dt=dt)
 
-    # Plan to go home at the end which we'll assume is q0
+    # Plan to go home at the end, which is q0 unless the caller named somewhere else (see q_return).
     q_last = last_js.position[0]
-    q_home = best_particle["q0"].clone()
+    q0 = best_particle["q0"]
+    q_home = q0.clone() if q_return is None else torch.as_tensor(q_return).to(q0).clone()
     js_last = JointState.from_position(q_last[None])
     js_home = JointState.from_position(q_home[None])
     with timer.time(f"{timeline}_planning"):

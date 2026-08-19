@@ -461,8 +461,15 @@ def run_cutamp(
     grasps: Optional[dict] = None,
     motion_gen: Optional[MotionGen] = None,
     experiment_dir: Optional[Path] = None,
+    q_return: Optional[List[float]] = None,
 ):
-    """Overall cuTAMP algorithm implementation."""
+    """Overall cuTAMP algorithm implementation.
+
+    ``q_return`` overrides where the closing GoToInitial drives to; see ``solve_curobo``. Single-arm
+    only -- the dual solver builds its return leg from the named q0 rather than a configuration.
+    """
+    if q_return is not None and config.arm_mode == "dual":
+        raise NotImplementedError("q_return is not supported for dual-arm plans")
     if config.m2t2_grasps and not grasps:
         _log.warning(f"M2T2 grasps enabled but no grasps provided! Falling back to grasp_dof={config.grasp_dof}")
 
@@ -715,6 +722,7 @@ def run_cutamp(
                             obj_to_initial_pose=obj_to_initial_pose,
                             timeline=f"curobo_{curr_idx}",
                             motion_gen=motion_gen,
+                            **({} if solver is solve_curobo_dual else {"q_return": q_return}),
                         )
                         _log.info("Successful plan found!")
                         failure_reason = None
