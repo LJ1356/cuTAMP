@@ -261,10 +261,13 @@ COST_DOCS = {
         ],
     },
     "GraspCost": {
-        "summary": "Soft cost: end-effector orientation change to reach the grasp.",
-        "detail": "Geodesic angle between the grasp's end-effector orientation and the robot's initial EE "
-        "orientation (FK of q_init); minimized to prefer grasps that reorient the wrist least. Opt-in: only "
-        "reduced when a GraspCost multiplier is set, otherwise the computed value is dropped.",
+        "summary": "Soft costs scoring the grasp itself: EE orientation change, and how off-center it is.",
+        "detail": "Two independently opt-in terms. `grasp_rot_change` is the geodesic angle between the "
+        "grasp's end-effector orientation and the robot's initial EE orientation (FK of q_init); minimized "
+        "to prefer grasps that reorient the wrist least. `grasp_center_offset` is the horizontal distance "
+        "(meters) from the object's frame origin to the grasp's TCP; minimized to prefer grasps near the "
+        "middle of the object over ones out at an edge, which are unstable to hold. Opt-in: only reduced "
+        "when the matching GraspCost multiplier is set, otherwise the computed value is dropped.",
         "params": [
             ["obj", "The object being grasped."],
             ["grasp", "The grasp pose being scored."],
@@ -315,9 +318,9 @@ CONSTRAINT_REMOVABILITY = {
         "effect": "Soft cost, but removing it breaks rollout validation (its confs must equal the rollout's). "
         "To stop shaping toward short paths, set its multiplier to 0 rather than removing it."},
     "GraspCost": {"tier": "free", "label": "removable",
-        "effect": "Soft cost charging the EE orientation change to reach the grasp. Removing it (or setting "
-        "its multiplier to 0) stops shaping toward grasps that reorient the wrist least; feasibility is "
-        "unaffected."},
+        "effect": "Soft costs charging the EE orientation change to reach the grasp and how far off-center "
+        "the grasp sits on the object. Removing it (or setting its multipliers to 0) stops shaping toward "
+        "grasps that reorient the wrist least / grip near the object's middle; feasibility is unaffected."},
 }
 
 PLAN_DOCS = {

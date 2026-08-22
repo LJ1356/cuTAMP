@@ -78,6 +78,12 @@ class TAMPConfiguration:
     # multiplier as weight 1.0, so an always-emitted value would change every caller's objective; the
     # weight is set separately via constraint_to_mult[GraspCost.type]["grasp_rot_change"].
     grasp_orientation_cost: bool = False
+    # Enable the GraspCost soft cost: horizontal (in-object-frame xy) distance between the grasp's TCP
+    # and the object's frame origin, steering the planner toward grasps nearer the middle of the object
+    # rather than out at an edge, where the lever arm about the contact makes the hold unstable. Gated
+    # here (default off) for the same weight-1.0 reason as grasp_orientation_cost above; the weight is
+    # set separately via constraint_to_mult[GraspCost.type]["grasp_center_offset"].
+    grasp_center_cost: bool = False
 
     ## Task Planning and subgraph caching
     # Number of initial plans to sample
