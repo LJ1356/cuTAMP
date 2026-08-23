@@ -66,6 +66,11 @@ class Rollout(TypedDict):
     gripper_close: List[bool]
     action_params: List[str]
     obj_to_pose: Dict[str, Float[torch.Tensor, "num_particles *h 4 4"]]
+    # obj_from_grasp for every grasp parameter in the skeleton, keyed by parameter name. The grasp
+    # is a rigid offset in the OBJECT frame, so this is timestep- and arm-independent -- costs that
+    # score the grasp itself (see CostFunction.grasp_soft_costs) read it directly instead of
+    # un-transforming world_from_tool_desired at the grasp's timestep.
+    grasp_to_obj_from_grasp: Dict[str, Float[torch.Tensor, "num_particles 4 4"]]
     action_to_ts: Dict[str, int]
     action_to_pose_ts: Dict[str, int]
     ts_to_pose_ts: Dict[int, int]
@@ -446,6 +451,7 @@ class RolloutFunction:
             gripper_close=gripper_close,
             action_params=action_params,
             obj_to_pose=obj_to_pose,
+            grasp_to_obj_from_grasp=grasp_to_mat4x4,
             action_to_ts=action_to_ts,
             action_to_pose_ts=action_to_pose_ts,
             ts_to_pose_ts=ts_to_pose_ts,
