@@ -17,6 +17,7 @@ from curobo.types.math import Pose
 
 from cutamp.config import TAMPConfiguration
 from cutamp.costs import sphere_to_sphere_overlap
+from cutamp.posture_prior import DEFAULT_POSTURE_REF, load_posture_prior, posture_penalty
 from cutamp.robots.bimanual_yam import bimanual_yam_neutral_joint_positions
 from cutamp.samplers import (
     grasp_4dof_sampler,
@@ -54,10 +55,65 @@ from cutamp.utils.shapes import MultiSphere
 
 _log = logging.getLogger(__name__)
 
-# How far out along the object each hand grasps for a handover, as a fraction of the usable
-# half-length, and how much of the end is left unusable so the pads stay on solid material.
-_HANDOVER_END_FRACTION = (0.55, 1.0)
-_HANDOVER_END_MARGIN = 0.02
+
+# --------------------------------------------------------------------------------------------- #
+# Teleop-posture IK branch selection                                                             #
+# --------------------------------------------------------------------------------------------- #
+_posture_warned = False
+
+
+def select_posture_branch(ik_result, goal_pose: Pose, ik_solver, config: TAMPConfiguration):
+    """Pick, per particle, the IK branch with the lowest data-derived posture penalty.
+
+    cuRobo ranks the seeds it returns by ``pose_error + null_space_error``, and
+    ``null_space_cfg.weight`` is 0.001 against a generic home retract -- so with the default
+    ``return_seeds=1`` the redundant arm's branch is effectively chosen by pose error alone, and
+    the arm's redundancy lands wherever, independently at every endpoint. This scores every
+    returned branch with ``posture_prior.posture_penalty`` (per-joint-pair human bands weighted by
+    each pair's null-space freeness, all baked from data) and keeps the best.
+
+    Returns ``[num_particles, dof]``. Falls back to cuRobo's own top seed (``solution[:, 0]``, the
+    previous behaviour) for any particle with no FK-valid branch, and whenever the baked prior does
+    not fit this arm -- so enabling it can never lose a solution that would otherwise be found.
+    """
+    global _posture_warned
+    sol = ik_result.solution                                        # [n, k, dof]
+    if config.posture_selection_seeds <= 1 or sol.shape[1] <= 1:
+        return sol[:, 0]
+    n, k, dof = sol.shape
+
+    try:
+        pack = load_posture_prior(config.posture_ref or DEFAULT_POSTURE_REF, sol.device, sol.dtype)
+    except (OSError, KeyError) as exc:
+        if not _posture_warned:
+            _log.warning(f"posture selection disabled: could not load the posture prior ({exc})")
+            _posture_warned = True
+        return sol[:, 0]
+    if pack["n_joints"] > dof:
+        # e.g. a prior baked for a 7-DOF arm against a 6-DOF one, which has no redundancy anyway.
+        if not _posture_warned:
+            _log.warning(
+                f"posture selection disabled: prior covers {pack['n_joints']} joints but this arm "
+                f"has {dof} DOF -- re-bake with cutamp/scripts/bake_posture_ref.py"
+            )
+            _posture_warned = True
+        return sol[:, 0]
+
+    # cuRobo's IKResult.success comes back all-False in this batched path, so validate by FK.
+    fk = ik_solver.fk(sol.reshape(-1, dof)).ee_pose
+    d_pos = (fk.position.reshape(n, k, 3) - goal_pose.position.unsqueeze(1)).norm(dim=-1)
+    dot = (fk.quaternion.reshape(n, k, 4) * goal_pose.quaternion.unsqueeze(1)).sum(-1).abs().clamp(max=1.0)
+    valid = (d_pos < config.posture_pos_tol) & (2 * torch.acos(dot) < config.posture_rot_tol)
+
+    penalty = posture_penalty(sol, pack).masked_fill(~valid, float("inf"))   # [n, k]
+    chosen = sol[torch.arange(n, device=sol.device), penalty.argmin(dim=1)]
+    # No FK-valid branch for this particle -> keep cuRobo's top seed, exactly as before.
+    none_valid = ~valid.any(dim=1)
+    if none_valid.any():
+        chosen = torch.where(none_valid.unsqueeze(1), sol[:, 0], chosen)
+    return chosen
+
+
 
 
 class ParticleInitializer:
@@ -79,6 +135,10 @@ class ParticleInitializer:
 
         # Sampler caching
         self._arm_sphere_rows = None
+        # NOTE: these caches are per-run -- run_cutamp builds a ParticleInitializer alongside one
+        # TAMPConfiguration (algorithm.py) and drops it with that run. "q_posture" entries below
+        # therefore cannot outlive the posture prior/seed count that produced them. If this object is
+        # ever hoisted to live across configs, key or invalidate those entries on the prior.
         self.pick_cache = {}
         self.place_cache = {}
         self.push_button_cache = {}
@@ -339,8 +399,12 @@ class ParticleInitializer:
                 if obj in self.pick_cache:
                     # important, we need to clone here
                     particles[grasp] = self.pick_cache[obj]["sampled_grasps"].clone()
-                    ik_result = self.pick_cache[obj]["ik_result"]
-                    particles[q] = ik_result.solution[:, 0].clone()
+                    _cache_entry = self.pick_cache[obj]
+                    ik_result = _cache_entry["ik_result"]
+                    # posture-selected branch if this cache entry has one (see
+                    # select_posture_branch); otherwise cuRobo's top seed, as before.
+                    _cached_q = _cache_entry.get("q_posture")
+                    particles[q] = (ik_result.solution[:, 0] if _cached_q is None else _cached_q).clone()
                     deferred_params.remove(q)
                     log_debug(
                         f"{header}. Using cached grasp poses for {obj}. {ik_result.success.sum()}/{num_particles} success"
@@ -371,11 +435,16 @@ class ParticleInitializer:
 
                     # Solve IK with cuRobo
                     world_from_ee = Pose.from_matrix(world_from_ee)
-                    ik_result = world.ik_solver.solve_batch(world_from_ee, seed_config=None)  # TODO: seeding
+                    ik_result = world.ik_solver.solve_batch(
+                        world_from_ee, seed_config=None,
+                        return_seeds=max(1, config.posture_selection_seeds),
+                    )
                     log_debug(
                         f"{header}. IK success: {ik_result.success.sum()}/{num_particles}, took {ik_result.solve_time:.2f}s"
                     )
-                    particles[q] = ik_result.solution[:, 0]
+                    particles[q] = select_posture_branch(
+                        ik_result, world_from_ee, world.ik_solver, config
+                    )
                 deferred_params.remove(q)
 
                 # Store in cache
@@ -383,6 +452,8 @@ class ParticleInitializer:
                     self.pick_cache[obj] = {
                         "sampled_grasps": particles[grasp],
                         "ik_result": ik_result,
+                        # posture-selected branch (see select_posture_branch); solution[:, 0] otherwise
+                        "q_posture": particles[q],
                         "confidences": particles[f"{grasp}_confidences"],
                     }
 
@@ -410,8 +481,12 @@ class ParticleInitializer:
                     # important, we need to clone here
                     sampled_placements = self.place_cache[(obj, surface)]["sampled_placements"].clone()
                     particles[placement] = sampled_placements
-                    ik_result = self.place_cache[(obj, surface)]["ik_result"]
-                    particles[q] = ik_result.solution[:, 0].clone()
+                    _cache_entry = self.place_cache[(obj, surface)]
+                    ik_result = _cache_entry["ik_result"]
+                    # posture-selected branch if this cache entry has one (see
+                    # select_posture_branch); otherwise cuRobo's top seed, as before.
+                    _cached_q = _cache_entry.get("q_posture")
+                    particles[q] = (ik_result.solution[:, 0] if _cached_q is None else _cached_q).clone()
                     deferred_params.remove(q)
                     log_debug(
                         f"{header}. Using cached placement poses for {obj}. {ik_result.success.sum()}/{num_particles} success"
@@ -467,11 +542,16 @@ class ParticleInitializer:
 
                     # Solve IK
                     world_from_ee = Pose.from_matrix(world_from_ee)
-                    ik_result = world.ik_solver.solve_batch(world_from_ee, seed_config=None)  # TODO: seeding?
+                    ik_result = world.ik_solver.solve_batch(
+                        world_from_ee, seed_config=None,
+                        return_seeds=max(1, config.posture_selection_seeds),
+                    )
                     log_debug(
                         f"{header}. IK success: {ik_result.success.sum()}/{num_particles}, took {ik_result.solve_time:.2f}s"
                     )
-                    particles[q] = ik_result.solution[:, 0]
+                    particles[q] = select_posture_branch(
+                        ik_result, world_from_ee, world.ik_solver, config
+                    )
                 deferred_params.remove(q)
 
                 # Store in cache
@@ -479,6 +559,7 @@ class ParticleInitializer:
                     self.place_cache[(obj, surface)] = {
                         "sampled_placements": sampled_placements,
                         "ik_result": ik_result,
+                        "q_posture": particles[q],
                         "grasp": particles[grasp],
                     }
 
@@ -501,8 +582,12 @@ class ParticleInitializer:
                     # important, we need to clone here
                     sampled_push = self.push_button_cache[button]["sampled_push"].clone()
                     particles[push_pose] = sampled_push
-                    ik_result = self.push_button_cache[button]["ik_result"]
-                    particles[q] = ik_result.solution[:, 0].clone()
+                    _cache_entry = self.push_button_cache[button]
+                    ik_result = _cache_entry["ik_result"]
+                    # posture-selected branch if this cache entry has one (see
+                    # select_posture_branch); otherwise cuRobo's top seed, as before.
+                    _cached_q = _cache_entry.get("q_posture")
+                    particles[q] = (ik_result.solution[:, 0] if _cached_q is None else _cached_q).clone()
                     deferred_params.remove(q)
                     log_debug(
                         f"{header}. Using cached push poses for {button}. {ik_result.success.sum()}/{num_particles} success"
@@ -533,11 +618,16 @@ class ParticleInitializer:
 
                 # Solve IK with cuRobo
                 world_from_ee = Pose.from_matrix(world_from_ee)
-                ik_result = world.ik_solver.solve_batch(world_from_ee, seed_config=None)  # TODO: seeding
+                ik_result = world.ik_solver.solve_batch(
+                    world_from_ee, seed_config=None,
+                    return_seeds=max(1, config.posture_selection_seeds),
+                )
                 log_debug(
                     f"{header}. IK success: {ik_result.success.sum()}/{num_particles}, took {ik_result.solve_time:.2f}s"
                 )
-                particles[q] = ik_result.solution[:, 0]
+                particles[q] = select_posture_branch(
+                    ik_result, world_from_ee, world.ik_solver, config
+                )
                 deferred_params.remove(q)
 
                 # Failed subgraph!
@@ -546,7 +636,11 @@ class ParticleInitializer:
 
                 # Cache the push poses
                 if config.cache_subgraphs:
-                    self.push_button_cache[button] = {"sampled_push": sampled_push, "ik_result": ik_result}
+                    self.push_button_cache[button] = {
+                        "sampled_push": sampled_push,
+                        "ik_result": ik_result,
+                        "q_posture": particles[q],
+                    }
 
             # Push Button with Stick
             elif op_name == PushStick.name:
@@ -573,8 +667,12 @@ class ParticleInitializer:
                     # important, we need to clone here
                     sampled_push = self.push_stick_cache[(button, stick_name)]["sampled_push"].clone()
                     particles[push_pose] = sampled_push
-                    ik_result = self.push_stick_cache[(button, stick_name)]["ik_result"]
-                    particles[q] = ik_result.solution[:, 0].clone()
+                    _cache_entry = self.push_stick_cache[(button, stick_name)]
+                    ik_result = _cache_entry["ik_result"]
+                    # posture-selected branch if this cache entry has one (see
+                    # select_posture_branch); otherwise cuRobo's top seed, as before.
+                    _cached_q = _cache_entry.get("q_posture")
+                    particles[q] = (ik_result.solution[:, 0] if _cached_q is None else _cached_q).clone()
                     deferred_params.remove(q)
 
                     log_debug(
@@ -634,11 +732,16 @@ class ParticleInitializer:
 
                 # Solve IK with cuRobo
                 world_from_ee = Pose.from_matrix(world_from_ee)
-                ik_result = world.ik_solver.solve_batch(world_from_ee, seed_config=None)  # TODO: seeding
+                ik_result = world.ik_solver.solve_batch(
+                    world_from_ee, seed_config=None,
+                    return_seeds=max(1, config.posture_selection_seeds),
+                )
                 log_debug(
                     f"{header}. IK success: {ik_result.success.sum()}/{num_particles}, took {ik_result.solve_time:.2f}s"
                 )
-                particles[q] = ik_result.solution[:, 0]
+                particles[q] = select_posture_branch(
+                    ik_result, world_from_ee, world.ik_solver, config
+                )
                 deferred_params.remove(q)
 
                 # Store in cache
@@ -646,6 +749,7 @@ class ParticleInitializer:
                     self.push_stick_cache[(button, stick_name)] = {
                         "sampled_push": sampled_push,
                         "ik_result": ik_result,
+                        "q_posture": particles[q],
                         "grasp": particles[grasp],
                     }
 

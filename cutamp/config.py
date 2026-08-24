@@ -8,7 +8,7 @@
 # its affiliates is strictly prohibited.
 
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Literal, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -141,6 +141,32 @@ class TAMPConfiguration:
     # get a pointless up-and-down from an apex, so they keep the direct plan. Ignored when
     # transit_apex_height is 0.
     transit_apex_min_dist: float = 0.10
+
+    # --- Teleop-posture IK branch selection -------------------------------------------------- #
+    # Every plan endpoint comes from ik_solver.solve_batch(..., seed_config=None) with the default
+    # return_seeds=1, and cuRobo ranks its seeds by pose_error + null_space_error where
+    # null_space_cfg.weight is 0.001 against a generic home retract -- i.e. the redundant arm's
+    # branch is picked by pose error alone, independently for every endpoint. The arm's redundancy
+    # then lands wherever, which is the bulk of why TAMP trajectories visit joint configurations
+    # teleoperation never does.
+    #
+    # With this set to k > 1, each endpoint's IK is solved with return_seeds=k and the branch with
+    # the lowest posture penalty is kept instead of cuRobo's top seed. The penalty is entirely
+    # data-derived -- see cutamp/posture_prior.py and the baked posture_ref.npz: a per-joint-pair
+    # human band weighted by how much that pair's direction is free to move (Jacobian null space).
+    # There is nothing to tune per scene; k is the only knob.
+    #
+    # Measured on 512-particle batches this costs nothing (~31 ms at k=12 against multi-second
+    # plans). 0 or 1 (the default) disables it: IK is solved and read exactly as before.
+    posture_selection_seeds: int = 0
+    # Path to the baked prior. None -> cutamp/posture_ref.npz (or $CUTAMP_POSTURE_REF).
+    posture_ref: Optional[str] = None
+    # Tolerances a returned seed must meet, by forward kinematics, to be considered at all.
+    # cuRobo's IKResult.success comes back all-False in this batched path, so the branches are
+    # validated by FK rather than trusted.
+    posture_pos_tol: float = 5e-3
+    posture_rot_tol: float = 0.05
+
     # Whether to also optimize full trajectories (not supported right now)
     enable_traj: bool = False
     # Motion plan with cuRobo after optimization
@@ -236,6 +262,14 @@ def validate_tamp_config(config: TAMPConfiguration):
         raise ValueError(f"transit_apex_height must be non-negative, not {config.transit_apex_height}")
     if config.transit_apex_min_dist < 0:
         raise ValueError(f"transit_apex_min_dist must be non-negative, not {config.transit_apex_min_dist}")
+
+    # Teleop-posture IK branch selection
+    if config.posture_selection_seeds < 0:
+        raise ValueError(f"posture_selection_seeds must be non-negative, not {config.posture_selection_seeds}")
+    if config.posture_selection_seeds < 0:
+        raise ValueError(
+            f"posture_selection_seeds must be non-negative, not {config.posture_selection_seeds}"
+        )
 
     # Motion refinement
     if config.max_motion_refine_attempts is not None and config.max_motion_refine_attempts <= 0:
