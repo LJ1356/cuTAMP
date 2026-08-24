@@ -159,6 +159,23 @@ class TAMPConfiguration:
     # Measured on 512-particle batches this costs nothing (~31 ms at k=12 against multi-second
     # plans). 0 or 1 (the default) disables it: IK is solved and read exactly as before.
     posture_selection_seeds: int = 0
+    # Also consider the pi-ROLLED twin of each grasp. A parallel jaw is invariant to a pi roll about
+    # its approach axis, so every grasp has two equally valid end-effector poses -- and cuTAMP only
+    # ever builds one of them, chosen by whichever representative M2T2 happened to emit. Roughly half
+    # the time that is the one teleoperation never uses, and NO amount of IK branch selection can fix
+    # it, because both branches of a single pose share that pose's wrist roll.
+    #
+    # This is the dominant residual once branch selection is on: measured over 512 endpoints, the
+    # best achievable branch of the given pose alone still leaves 37-42% of configurations outside
+    # held-out DROID's 99th percentile, while adding the twin pose takes the SELECTED configuration
+    # to 5% (fruits) / 7% (plate). The twin wins about half the time, as expected.
+    #
+    # Costs one extra solve_batch per endpoint (they must be separate same-size calls -- doubling
+    # the batch trips cuRobo's cuda graph with "changing goal type"). When the twin wins, the stored
+    # obj_from_grasp is rolled to match, so the recorded grasp always agrees with the configuration.
+    # Only applies where the grasp is a 4x4 matrix (M2T2 grasps); 4/6-DOF sampled grasps are skipped
+    # because rolling them cannot be expressed in their parameterisation.
+    posture_grasp_roll: bool = True
     # Path to the baked prior. None -> cutamp/posture_ref.npz (or $CUTAMP_POSTURE_REF).
     posture_ref: Optional[str] = None
     # Tolerances a returned seed must meet, by forward kinematics, to be considered at all.
