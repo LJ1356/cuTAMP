@@ -42,6 +42,17 @@ class TAMPConfiguration:
     # it. Must have one entry per planned joint. A tuple, so the frozen config stays hashable.
     q_home: Optional[tuple[float, ...]] = None
 
+    # Whether the motion plan ends by driving the arm back to its resting configuration (q_home, or
+    # q0 when that is None). True is the standalone behaviour: a plan is the whole episode, so it
+    # parks the arm clear of the workspace when it is done.
+    #
+    # False is for a plan that is one LEG of a longer episode -- the next leg (another cuTAMP goal,
+    # or a human teleoperating) carries straight on from where this one stops, and a return to home
+    # in between is motion the task never asked for, recorded into the middle of the demonstration.
+    # Only the go-home segment is dropped; the short retract that lifts the gripper clear of what it
+    # just placed is always planned, since it is what makes the end pose safe to continue from.
+    return_home: bool = True
+
     # Grasp and Placements
     grasp_dof: Literal[4, 6] = 4
     place_dof: Literal[4] = 4

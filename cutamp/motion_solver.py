@@ -427,36 +427,42 @@ def solve_curobo(
     # own starting configuration, which is only "home" if something put the arm there beforehand.
     # The distinction matters because this target is the SAME for every particle: when it cannot be
     # reached, no particle's trajectory can complete, and the whole plan fails at once.
-    q_last = last_js.position[0]
-    if config.q_home is not None:
-        if len(config.q_home) != q_last.shape[0]:
-            raise ValueError(
-                f"config.q_home has {len(config.q_home)} joints but the robot has {q_last.shape[0]}"
-            )
-        q_home = torch.tensor(config.q_home, dtype=q_last.dtype, device=q_last.device)
-    else:
-        q_home = best_particle["q0"].clone()
-    js_last = JointState.from_position(q_last[None])
-    js_home = JointState.from_position(q_home[None])
-    with timer.time(f"{timeline}_planning"):
-        result = motion_gen.plan_single_js(js_last, js_home, plan_config)
-    if not result.success:
-        raise MotionPlanningError("Failed to plan for going home")
+    #
+    # Skipped entirely when `config.return_home` is off: this plan is one leg of a longer episode and
+    # whatever runs next -- another cuTAMP goal, or a human on the teleop rig -- carries on from the
+    # retract above. Not planning it at all (rather than dropping the segment afterwards) also means
+    # a home pose that happens to be unreachable from here cannot fail the leg.
+    if config.return_home:
+        q_last = last_js.position[0]
+        if config.q_home is not None:
+            if len(config.q_home) != q_last.shape[0]:
+                raise ValueError(
+                    f"config.q_home has {len(config.q_home)} joints but the robot has {q_last.shape[0]}"
+                )
+            q_home = torch.tensor(config.q_home, dtype=q_last.dtype, device=q_last.device)
+        else:
+            q_home = best_particle["q0"].clone()
+        js_last = JointState.from_position(q_last[None])
+        js_home = JointState.from_position(q_home[None])
+        with timer.time(f"{timeline}_planning"):
+            result = motion_gen.plan_single_js(js_last, js_home, plan_config)
+        if not result.success:
+            raise MotionPlanningError("Failed to plan for going home")
 
-    dt = result.interpolation_dt
-    plan = result.get_interpolated_plan()
-    accum_plans.append(
-        {
-            "type": "trajectory",
-            "plan": plan,
-            "dt": dt,
-            "optimized_plan": result.optimized_plan,
-            "optimized_dt": result.optimized_dt,
-            "label": "GoToInitial(q0)",
-        }
-    )
-    _ = visualizer.log_joint_trajectory(plan.position, timeline=timeline, start_time=ts, dt=dt)
-    _log.debug("Planned to go home")
+        dt = result.interpolation_dt
+        plan = result.get_interpolated_plan()
+        accum_plans.append(
+            {
+                "type": "trajectory",
+                "plan": plan,
+                "dt": dt,
+                "optimized_plan": result.optimized_plan,
+                "optimized_dt": result.optimized_dt,
+                "label": "GoToInitial(q0)",
+            }
+        )
+        _ = visualizer.log_joint_trajectory(plan.position, timeline=timeline, start_time=ts, dt=dt)
+        _log.debug("Planned to go home")
 
     _log.info(f"Motion planning metrics: {timer.get_summary(f'{timeline}_planning')}")
     return accum_plans
@@ -835,7 +841,8 @@ def solve_curobo_dual(
         else:
             raise NotImplementedError(f"Unsupported operator for dual-arm motion planning: {op_name}")
 
-    # Return home
-    plan_to("q0", "GoToInitial(q0)")
+    # Return home -- unless this plan is one leg of a longer episode (see config.return_home).
+    if config.return_home:
+        plan_to("q0", "GoToInitial(q0)")
     _log.info(f"Motion planning metrics: {timer.get_summary(f'{timeline}_planning')}")
     return accum_plans
