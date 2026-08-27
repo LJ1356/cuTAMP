@@ -9,7 +9,7 @@
 
 import os
 import warnings
-from typing import Dict, List, ClassVar, Set, Tuple
+from typing import Dict, List, ClassVar, Sequence, Set, Tuple
 
 import torch
 import yaml
@@ -33,12 +33,16 @@ class TAMPEnvironment:
         statics: List[Obstacle],
         type_to_objects: Dict[str, List[Obstacle]],
         goal_state: State,
+        pick_transparent: Sequence[str] = (),
     ):
         self.name = name
         self.movables = movables
         self.statics = statics
         self.type_to_objects = type_to_objects
         self.goal_state = goal_state
+        # Statics the arm is allowed to reach INTO -- open containers that perception
+        # reconstructs as filled solids. See TAMPWorld.pick_transparent.
+        self.pick_transparent = tuple(pick_transparent)
 
         # No object (identified by name) should be in both movables and statics
         movable_names = {obj.name for obj in movables}

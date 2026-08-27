@@ -8,7 +8,7 @@
 # its affiliates is strictly prohibited.
 
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Literal, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -60,6 +60,18 @@ class TAMPConfiguration:
     # M2T2 Grasps which will be used first, and then grasp_dof fallback
     m2t2_grasps: bool = False
 
+    # Fail instead of silently falling back to heuristic grasps when M2T2 proposes NOTHING for an
+    # object that has to be picked. With m2t2_grasps on, a zero-candidate object is currently NOT
+    # dropped: `_sample_grasps` falls through to grasp_4dof_sampler/grasp_6dof_sampler, which sample
+    # grasps from the object's collision-sphere approximation rather than from perception. Measured
+    # over shipped runs, 18-43% of picked objects took that path, and it is a direct mechanism for
+    # closing on empty air (analysis_dataset_diff/TELEOP_VS_APEX.md, Finding 5).
+    #
+    # Default False so every existing config keeps its current planning outcomes; the fallback is
+    # warned about either way. Turn on for data collection, where a guessed grasp that misses costs
+    # a whole mislabelled episode. Opt in from cfg/tamp with `require_m2t2_grasps: true`.
+    require_m2t2_grasps: bool = False
+
     # Approach to use. Note: optimization includes particle initialization (i.e., sampling)
     approach: Literal["optimization", "sampling"] = "optimization"
 
@@ -97,6 +109,12 @@ class TAMPConfiguration:
     # multiplier as weight 1.0, so an always-emitted value would change every caller's objective; the
     # weight is set separately via constraint_to_mult[GraspCost.type]["grasp_rot_change"].
     grasp_orientation_cost: bool = False
+    # Enable the GraspCost soft cost: horizontal (in-object-frame xy) distance between the grasp's TCP
+    # and the object's frame origin, steering the planner toward grasps nearer the middle of the object
+    # rather than out at an edge, where the lever arm about the contact makes the hold unstable. Gated
+    # here (default off) for the same weight-1.0 reason as grasp_orientation_cost above; the weight is
+    # set separately via constraint_to_mult[GraspCost.type]["grasp_center_offset"].
+    grasp_center_cost: bool = False
 
     ## Task Planning and subgraph caching
     # Number of initial plans to sample
@@ -131,6 +149,72 @@ class TAMPConfiguration:
     # float("inf") is the max joint displacement (the infinity-norm). Both lower-bound the shortest
     # collision-free path length between the two configurations.
     traj_length_norm: float = 2.0
+    # Height (metres) of an explicit APEX waypoint inserted into each free-space transit of a Pick or
+    # Place -- the long unconstrained leg between the retract and the pre-grasp/pre-place pose. The
+    # transit is planned as start -> apex -> goal instead of start -> goal, where the apex sits at the
+    # horizontal midpoint of the two end-effector positions, `transit_apex_height` above the HIGHER of
+    # them, carrying the goal orientation.
+    #
+    # Why an explicit waypoint rather than a cost: cuRobo's trajopt objective is entirely joint-space
+    # (bound_cfg's L2 on acceleration/jerk plus the limit hinges) and has no term reading the
+    # end-effector's Cartesian path, so with fixed endpoints its optimum is the joint-space geodesic --
+    # the EE skims across the table in a low lateral sweep. Splitting the transit at an apex changes
+    # the endpoints themselves, which is the only lever that shapes the Cartesian path without adding
+    # a new cost term.
+    #
+    # 0.0 (default) disables it: the transit is planned exactly as before, one plan_single call.
+    # Applies to the single-arm solver (solve_curobo) only. If either apex leg fails to plan, the
+    # solver silently falls back to the direct transit, so enabling this can never lose a plan that
+    # would otherwise have been found.
+    transit_apex_height: float = 0.0
+    # Minimum horizontal (xy) distance between the transit's start and goal end-effector positions for
+    # the apex to be inserted. Short transits -- an object placed right next to where it was picked --
+    # get a pointless up-and-down from an apex, so they keep the direct plan. Ignored when
+    # transit_apex_height is 0.
+    transit_apex_min_dist: float = 0.10
+
+    # --- Teleop-posture IK branch selection -------------------------------------------------- #
+    # Every plan endpoint comes from ik_solver.solve_batch(..., seed_config=None) with the default
+    # return_seeds=1, and cuRobo ranks its seeds by pose_error + null_space_error where
+    # null_space_cfg.weight is 0.001 against a generic home retract -- i.e. the redundant arm's
+    # branch is picked by pose error alone, independently for every endpoint. The arm's redundancy
+    # then lands wherever, which is the bulk of why TAMP trajectories visit joint configurations
+    # teleoperation never does.
+    #
+    # With this set to k > 1, each endpoint's IK is solved with return_seeds=k and the branch with
+    # the lowest posture penalty is kept instead of cuRobo's top seed. The penalty is entirely
+    # data-derived -- see cutamp/posture_prior.py and the baked posture_ref.npz: a per-joint-pair
+    # human band weighted by how much that pair's direction is free to move (Jacobian null space).
+    # There is nothing to tune per scene; k is the only knob.
+    #
+    # Measured on 512-particle batches this costs nothing (~31 ms at k=12 against multi-second
+    # plans). 0 or 1 (the default) disables it: IK is solved and read exactly as before.
+    posture_selection_seeds: int = 0
+    # Also consider the pi-ROLLED twin of each grasp. A parallel jaw is invariant to a pi roll about
+    # its approach axis, so every grasp has two equally valid end-effector poses -- and cuTAMP only
+    # ever builds one of them, chosen by whichever representative M2T2 happened to emit. Roughly half
+    # the time that is the one teleoperation never uses, and NO amount of IK branch selection can fix
+    # it, because both branches of a single pose share that pose's wrist roll.
+    #
+    # This is the dominant residual once branch selection is on: measured over 512 endpoints, the
+    # best achievable branch of the given pose alone still leaves 37-42% of configurations outside
+    # held-out DROID's 99th percentile, while adding the twin pose takes the SELECTED configuration
+    # to 5% (fruits) / 7% (plate). The twin wins about half the time, as expected.
+    #
+    # Costs one extra solve_batch per endpoint (they must be separate same-size calls -- doubling
+    # the batch trips cuRobo's cuda graph with "changing goal type"). When the twin wins, the stored
+    # obj_from_grasp is rolled to match, so the recorded grasp always agrees with the configuration.
+    # Only applies where the grasp is a 4x4 matrix (M2T2 grasps); 4/6-DOF sampled grasps are skipped
+    # because rolling them cannot be expressed in their parameterisation.
+    posture_grasp_roll: bool = True
+    # Path to the baked prior. None -> cutamp/posture_ref.npz (or $CUTAMP_POSTURE_REF).
+    posture_ref: Optional[str] = None
+    # Tolerances a returned seed must meet, by forward kinematics, to be considered at all.
+    # cuRobo's IKResult.success comes back all-False in this batched path, so the branches are
+    # validated by FK rather than trusted.
+    posture_pos_tol: float = 5e-3
+    posture_rot_tol: float = 0.05
+
     # Whether to also optimize full trajectories (not supported right now)
     enable_traj: bool = False
     # Motion plan with cuRobo after optimization
@@ -220,6 +304,20 @@ def validate_tamp_config(config: TAMPConfiguration):
     # Trajectory length norm (torch.norm requires p >= 1; inf is allowed for the max-norm)
     if config.traj_length_norm < 1:
         raise ValueError(f"traj_length_norm must be >= 1 (or inf), not {config.traj_length_norm}")
+
+    # Transit apex waypoint
+    if config.transit_apex_height < 0:
+        raise ValueError(f"transit_apex_height must be non-negative, not {config.transit_apex_height}")
+    if config.transit_apex_min_dist < 0:
+        raise ValueError(f"transit_apex_min_dist must be non-negative, not {config.transit_apex_min_dist}")
+
+    # Teleop-posture IK branch selection
+    if config.posture_selection_seeds < 0:
+        raise ValueError(f"posture_selection_seeds must be non-negative, not {config.posture_selection_seeds}")
+    if config.posture_selection_seeds < 0:
+        raise ValueError(
+            f"posture_selection_seeds must be non-negative, not {config.posture_selection_seeds}"
+        )
 
     # Motion refinement
     if config.max_motion_refine_attempts is not None and config.max_motion_refine_attempts <= 0:

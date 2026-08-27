@@ -8,7 +8,7 @@
 # its affiliates is strictly prohibited.
 import logging
 from collections import defaultdict
-from typing import Dict
+from typing import Collection, Dict
 
 import roma
 import torch
@@ -155,13 +155,27 @@ def approximate_goal_aabb(goal: Obstacle) -> Float[torch.Tensor, "2 3"]:
     return aabb
 
 
-def get_world_cfg(env: TAMPEnvironment, include_movables: bool = False) -> WorldConfig:
-    """Get the cuRobo WorldConfig from the TAMP environment."""
+def get_world_cfg(
+    env: TAMPEnvironment, include_movables: bool = False, exclude: Collection[str] = ()
+) -> WorldConfig:
+    """Get the cuRobo WorldConfig from the TAMP environment.
+
+    ``exclude`` drops obstacles by name. Used for the surfaces the arm is allowed to reach INTO --
+    see ``TAMPWorld.pick_transparent``.
+    """
     from cutamp.utils.obb import get_object_obb
 
     geoms = defaultdict(list)
-    obstacles = env.movables if include_movables else []
-    obstacles += env.statics
+    # Build a NEW list. `obstacles = env.movables` followed by `obstacles += env.statics` aliased the
+    # environment's own list and extended it in place, so every include_movables=True call appended
+    # the statics to env.movables permanently -- breaking TAMPEnvironment's movable/static invariant
+    # and making the name-keyed dicts built from movables (RolloutFunction.obj_to_initial_pose,
+    # TAMPWorld._obj_to_spheres) KeyError on a static's name the next time anything iterated
+    # world.movables. It only surfaced when planning continued past that call, e.g. when motion
+    # refinement failed for one skeleton and cuTAMP moved on to the next.
+    obstacles = [*env.movables, *env.statics] if include_movables else list(env.statics)
+    if exclude:
+        obstacles = [obj for obj in obstacles if obj.name not in exclude]
     for obj in obstacles:
         if isinstance(obj, Cuboid):
             geoms["cuboid"].append(obj)

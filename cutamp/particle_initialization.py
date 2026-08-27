@@ -17,6 +17,7 @@ from curobo.types.math import Pose
 
 from cutamp.config import TAMPConfiguration
 from cutamp.costs import sphere_to_sphere_overlap
+from cutamp.posture_prior import DEFAULT_POSTURE_REF, load_posture_prior, posture_penalty
 from cutamp.robots.bimanual_yam import bimanual_yam_neutral_joint_positions
 from cutamp.samplers import (
     grasp_4dof_sampler,
@@ -54,10 +55,152 @@ from cutamp.utils.shapes import MultiSphere
 
 _log = logging.getLogger(__name__)
 
-# How far out along the object each hand grasps for a handover, as a fraction of the usable
-# half-length, and how much of the end is left unusable so the pads stay on solid material.
-_HANDOVER_END_FRACTION = (0.55, 1.0)
-_HANDOVER_END_MARGIN = 0.02
+
+class NoGraspsError(RuntimeError):
+    """Perception proposed no grasps for an object that must be picked.
+
+    Raised only when ``TAMPConfiguration.require_m2t2_grasps`` is set; otherwise the heuristic
+    sampler stands in and a warning is logged. See ``_sample_grasps``.
+    """
+
+
+
+# --------------------------------------------------------------------------------------------- #
+# Teleop-posture IK branch selection                                                             #
+# --------------------------------------------------------------------------------------------- #
+_posture_warned = False
+_ROLL_CACHE: dict = {}
+
+
+def parallel_jaw_roll(device, dtype):
+    """Rz(pi) as a 4x4: the parallel-jaw grasp symmetry.
+
+    Verified for the FR3 that this commutes with ``tool_from_ee`` --
+    ``tool_from_ee @ Rz @ tool_from_ee^-1 == Rz`` exactly -- so the SAME matrix rolls the
+    end-effector pose and the stored ``obj_from_grasp``, and the two stay consistent.
+    """
+    key = (str(device), str(dtype))
+    if key not in _ROLL_CACHE:
+        r = torch.eye(4, device=device, dtype=dtype)
+        r[0, 0] = -1.0
+        r[1, 1] = -1.0
+        _ROLL_CACHE[key] = r
+    return _ROLL_CACHE[key]
+
+
+def _branch_scores(ik_result, goal_pose: Pose, ik_solver, config, pack):
+    """(solutions [n,k,dof], penalty [n,k] with invalid branches at +inf)."""
+    sol = ik_result.solution
+    n, k, dof = sol.shape
+    # cuRobo's IKResult.success comes back all-False in this batched path, so validate by FK.
+    fk = ik_solver.fk(sol.reshape(-1, dof)).ee_pose
+    d_pos = (fk.position.reshape(n, k, 3) - goal_pose.position.unsqueeze(1)).norm(dim=-1)
+    dot = (fk.quaternion.reshape(n, k, 4) * goal_pose.quaternion.unsqueeze(1)).sum(-1).abs().clamp(max=1.0)
+    valid = (d_pos < config.posture_pos_tol) & (2 * torch.acos(dot) < config.posture_rot_tol)
+    return sol, posture_penalty(sol, pack).masked_fill(~valid, float("inf"))
+
+
+def _posture_pack(sol, config):
+    """Load the baked prior for this arm, or None (with one warning) if it cannot be used."""
+    global _posture_warned
+    if config.posture_selection_seeds <= 1 or sol.shape[1] <= 1:
+        return None
+    try:
+        pack = load_posture_prior(config.posture_ref or DEFAULT_POSTURE_REF, sol.device, sol.dtype)
+    except (OSError, KeyError) as exc:
+        if not _posture_warned:
+            _log.warning(f"posture selection disabled: could not load the posture prior ({exc})")
+            _posture_warned = True
+        return None
+    if pack["n_joints"] > sol.shape[-1]:
+        # e.g. a prior baked for a 7-DOF arm against a 6-DOF one, which has no redundancy anyway.
+        if not _posture_warned:
+            _log.warning(
+                f"posture selection disabled: prior covers {pack['n_joints']} joints but this arm "
+                f"has {sol.shape[-1]} DOF -- re-bake with cutamp/scripts/bake_posture_ref.py"
+            )
+            _posture_warned = True
+        return None
+    return pack
+
+
+def _argmin_branch(sol, penalty, fallback):
+    """Lowest-penalty branch per particle; ``fallback`` where no branch is FK-valid."""
+    n = sol.shape[0]
+    chosen = sol[torch.arange(n, device=sol.device), penalty.argmin(dim=1)]
+    none_valid = torch.isinf(penalty).all(dim=1)
+    if none_valid.any():
+        chosen = torch.where(none_valid.unsqueeze(1), fallback, chosen)
+    return chosen
+
+
+def solve_with_grasp_roll(world, world_from_ee, config, obj_from_grasp_mat):
+    """Solve IK for a grasp AND its pi-rolled twin, select across both, roll the grasp to match.
+
+    A parallel jaw is invariant to a pi roll about its approach axis, so each grasp has two equally
+    valid end-effector poses. cuTAMP only ever builds one -- whichever representative M2T2 emitted --
+    and about half the time that is the wrist branch teleoperation never uses. Both IK branches of a
+    single pose share that pose's wrist roll, so branch selection alone cannot fix it; the twin pose
+    has to be in the pool.
+
+    Returns ``(q [n, dof], obj_from_grasp [n, 4, 4] or None, ik_result)``. The returned grasp is the
+    input with the roll applied wherever the twin won, so the recorded grasp always matches the
+    configuration; ``None`` means nothing was rolled and the caller keeps its existing grasp tensor.
+
+    IMPORTANT -- each pool is scored IMMEDIATELY after its own solve. ``solve_batch`` normalises its
+    goal quaternion in place and the Pose objects alias cuRobo's internal goal buffer, so a goal
+    held across a second solve is silently overwritten (measured drift 1.41 on a unit quaternion --
+    the first goal literally becomes the second). Scoring eagerly sidesteps that entirely; deferring
+    it made every branch of the first pool fail its FK check and the twin win 100% of the time.
+    """
+    seeds = max(1, config.posture_selection_seeds)
+    ik_result = world.ik_solver.solve_batch(world_from_ee, seed_config=None, return_seeds=seeds)
+    pack = _posture_pack(ik_result.solution, config)
+    roll_on = pack is not None and config.posture_grasp_roll and obj_from_grasp_mat is not None
+    if pack is None:
+        return ik_result.solution[:, 0], None, ik_result
+
+    # Score pool 1 NOW, while its goal is still intact.
+    sol, penalty = _branch_scores(ik_result, world_from_ee, world.ik_solver, config, pack)
+    if not roll_on:
+        return _argmin_branch(sol, penalty, ik_result.solution[:, 0]), None, ik_result
+
+    roll = parallel_jaw_roll(world_from_ee.position.device, world_from_ee.position.dtype)
+    # Separate same-size call: doubling the batch trips cuRobo's cuda graph ("changing goal type").
+    flipped = Pose.from_matrix(world_from_ee.get_matrix() @ roll)
+    alt_result = world.ik_solver.solve_batch(flipped, seed_config=None, return_seeds=seeds)
+    sol_a, pen_a = _branch_scores(alt_result, flipped, world.ik_solver, config, pack)
+
+    used_alt = pen_a.min(dim=1).values < penalty.min(dim=1).values
+    q = _argmin_branch(
+        torch.cat([sol, sol_a], dim=1), torch.cat([penalty, pen_a], dim=1), ik_result.solution[:, 0]
+    )
+    used_alt = used_alt & ~torch.isinf(pen_a).all(dim=1)
+    if not used_alt.any():
+        return q, None, ik_result
+    # Same roll applies on the grasp side: tool_from_ee @ Rz @ tool_from_ee^-1 == Rz for this arm.
+    rolled = obj_from_grasp_mat @ roll.to(obj_from_grasp_mat.dtype)
+    return q, torch.where(used_alt.view(-1, 1, 1), rolled, obj_from_grasp_mat), ik_result
+
+
+def select_posture_branch(ik_result, goal_pose: Pose, ik_solver, config: TAMPConfiguration):
+    """Pick, per particle, the IK branch with the lowest data-derived posture penalty.
+
+    cuRobo ranks the seeds it returns by ``pose_error + null_space_error``, and
+    ``null_space_cfg.weight`` is 0.001 against a generic home retract -- so with the default
+    ``return_seeds=1`` the redundant arm's branch is effectively chosen by pose error alone, and
+    the arm's redundancy lands wherever, independently at every endpoint. This scores every
+    returned branch with ``posture_prior.posture_penalty`` and keeps the best.
+
+    Returns ``[num_particles, dof]``. Falls back to cuRobo's own top seed (``solution[:, 0]``, the
+    previous behaviour) for any particle with no FK-valid branch, and whenever the baked prior does
+    not fit this arm -- so enabling it can never lose a solution that would otherwise be found.
+    """
+    pack = _posture_pack(ik_result.solution, config)
+    if pack is None:
+        return ik_result.solution[:, 0]
+    sol, penalty = _branch_scores(ik_result, goal_pose, ik_solver, config, pack)
+    return _argmin_branch(sol, penalty, ik_result.solution[:, 0])
 
 
 class ParticleInitializer:
@@ -79,6 +222,10 @@ class ParticleInitializer:
 
         # Sampler caching
         self._arm_sphere_rows = None
+        # NOTE: these caches are per-run -- run_cutamp builds a ParticleInitializer alongside one
+        # TAMPConfiguration (algorithm.py) and drops it with that run. "q_posture" entries below
+        # therefore cannot outlive the posture prior/seed count that produced them. If this object is
+        # ever hoisted to live across configs, key or invalidate those entries on the prior.
         self.pick_cache = {}
         self.place_cache = {}
         self.push_button_cache = {}
@@ -197,6 +344,38 @@ class ParticleInitializer:
         unchanged. Returns ``(selected_grasps, selected_confs, is_mat4x4)``.
         """
         config, world = self.config, self.world
+
+        n_m2t2 = len(self.grasps.get(obj, {}).get("grasps_obj", ())) if self.grasps else 0
+        if config.m2t2_grasps and n_m2t2 == 0:
+            # Perception proposed NOTHING for this object and the heuristic samplers below will
+            # quietly stand in -- sampling grasps off the object's COLLISION-SPHERE approximation,
+            # with no perception and no confidence behind them. On a plush toy that reconstructs as
+            # a lumpy blob of spheres, that is a grasp pose with no evidence any graspable geometry
+            # is there, and it is a direct mechanism for closing on empty air.
+            #
+            # Measured over the shipped runs' scene_objects.json
+            # (analysis_dataset_diff/TELEOP_VS_APEX.md, Finding 5): 43% of objects in
+            # 1_pp_toys_plate_vae_style_timing_apex_posture and 18% in ..._learned_posture had ZERO
+            # M2T2 candidates, and every one of them was picked anyway on these fallback grasps.
+            # It was invisible because the only trace was a _log.debug.
+            #
+            # The warning is unconditional -- a silent substitution of a different grasp source is
+            # never what a caller wants to not be told about. The raise is opt-in via
+            # `require_m2t2_grasps`, because failing here changes planning outcomes for every
+            # existing config and some of them legitimately rely on the heuristic path.
+            _log.warning(
+                f"No M2T2 grasps for {obj}: falling back to {config.grasp_dof}-DOF HEURISTIC grasps "
+                f"sampled from its collision spheres, not from perception. These miss far more "
+                f"often. Raise perception.m2t2.num_runs (tamp_overrides `m2t2_num_runs`) to give "
+                f"this object candidates; set `require_m2t2_grasps` to fail instead of guessing."
+            )
+            if config.require_m2t2_grasps:
+                raise NoGraspsError(
+                    f"no M2T2 grasp candidates for {obj!r} and require_m2t2_grasps is set. The "
+                    f"heuristic fallback would sample grasps from this object's collision spheres "
+                    f"rather than from perception."
+                )
+
         # Sample grasps
         obj_curobo = world.get_object(obj)
         num_faces = 4 if isinstance(obj_curobo, Cuboid) else None
@@ -205,7 +384,7 @@ class ParticleInitializer:
         sampled_confs = None
         is_mat4x4 = False
 
-        if config.m2t2_grasps and self.grasps and len(self.grasps[obj]["grasps_obj"]) > 0:
+        if config.m2t2_grasps and n_m2t2 > 0:
             _log.debug(f"Using M2T2 grasps for {obj}")
             provided_grasps = self.grasps[obj]["grasps_obj"]
             confs = self.grasps[obj]["confidences_pt"]
@@ -339,8 +518,12 @@ class ParticleInitializer:
                 if obj in self.pick_cache:
                     # important, we need to clone here
                     particles[grasp] = self.pick_cache[obj]["sampled_grasps"].clone()
-                    ik_result = self.pick_cache[obj]["ik_result"]
-                    particles[q] = ik_result.solution[:, 0].clone()
+                    _cache_entry = self.pick_cache[obj]
+                    ik_result = _cache_entry["ik_result"]
+                    # posture-selected branch if this cache entry has one (see
+                    # select_posture_branch); otherwise cuRobo's top seed, as before.
+                    _cached_q = _cache_entry.get("q_posture")
+                    particles[q] = (ik_result.solution[:, 0] if _cached_q is None else _cached_q).clone()
                     deferred_params.remove(q)
                     log_debug(
                         f"{header}. Using cached grasp poses for {obj}. {ik_result.success.sum()}/{num_particles} success"
@@ -369,13 +552,17 @@ class ParticleInitializer:
                     world_from_grasp = world_from_obj @ obj_from_grasp
                     world_from_ee = world_from_grasp @ world.tool_from_ee
 
-                    # Solve IK with cuRobo
+                    # Solve IK with cuRobo. Rolling the grasp is only expressible when it is
+                    # stored as a 4x4 (M2T2); the 4/6-DOF parameterisations cannot carry it.
                     world_from_ee = Pose.from_matrix(world_from_ee)
-                    ik_result = world.ik_solver.solve_batch(world_from_ee, seed_config=None)  # TODO: seeding
+                    particles[q], rolled_grasp, ik_result = solve_with_grasp_roll(
+                        world, world_from_ee, config, obj_from_grasp if is_mat4x4 else None
+                    )
+                    if rolled_grasp is not None:
+                        particles[grasp] = rolled_grasp
                     log_debug(
                         f"{header}. IK success: {ik_result.success.sum()}/{num_particles}, took {ik_result.solve_time:.2f}s"
                     )
-                    particles[q] = ik_result.solution[:, 0]
                 deferred_params.remove(q)
 
                 # Store in cache
@@ -383,6 +570,8 @@ class ParticleInitializer:
                     self.pick_cache[obj] = {
                         "sampled_grasps": particles[grasp],
                         "ik_result": ik_result,
+                        # posture-selected branch (see select_posture_branch); solution[:, 0] otherwise
+                        "q_posture": particles[q],
                         "confidences": particles[f"{grasp}_confidences"],
                     }
 
@@ -410,8 +599,12 @@ class ParticleInitializer:
                     # important, we need to clone here
                     sampled_placements = self.place_cache[(obj, surface)]["sampled_placements"].clone()
                     particles[placement] = sampled_placements
-                    ik_result = self.place_cache[(obj, surface)]["ik_result"]
-                    particles[q] = ik_result.solution[:, 0].clone()
+                    _cache_entry = self.place_cache[(obj, surface)]
+                    ik_result = _cache_entry["ik_result"]
+                    # posture-selected branch if this cache entry has one (see
+                    # select_posture_branch); otherwise cuRobo's top seed, as before.
+                    _cached_q = _cache_entry.get("q_posture")
+                    particles[q] = (ik_result.solution[:, 0] if _cached_q is None else _cached_q).clone()
                     deferred_params.remove(q)
                     log_debug(
                         f"{header}. Using cached placement poses for {obj}. {ik_result.success.sum()}/{num_particles} success"
@@ -465,13 +658,19 @@ class ParticleInitializer:
                     world_from_grasp = world_from_obj @ obj_from_grasp
                     world_from_ee = world_from_grasp @ world.tool_from_ee
 
-                    # Solve IK
+                    # Solve IK. The grasp is already bound by the preceding Pick, so a roll here
+                    # would contradict it -- only the branch is selected, the pose is fixed.
                     world_from_ee = Pose.from_matrix(world_from_ee)
-                    ik_result = world.ik_solver.solve_batch(world_from_ee, seed_config=None)  # TODO: seeding?
+                    ik_result = world.ik_solver.solve_batch(
+                        world_from_ee, seed_config=None,
+                        return_seeds=max(1, config.posture_selection_seeds),
+                    )
                     log_debug(
                         f"{header}. IK success: {ik_result.success.sum()}/{num_particles}, took {ik_result.solve_time:.2f}s"
                     )
-                    particles[q] = ik_result.solution[:, 0]
+                    particles[q] = select_posture_branch(
+                        ik_result, world_from_ee, world.ik_solver, config
+                    )
                 deferred_params.remove(q)
 
                 # Store in cache
@@ -479,6 +678,7 @@ class ParticleInitializer:
                     self.place_cache[(obj, surface)] = {
                         "sampled_placements": sampled_placements,
                         "ik_result": ik_result,
+                        "q_posture": particles[q],
                         "grasp": particles[grasp],
                     }
 
@@ -501,8 +701,12 @@ class ParticleInitializer:
                     # important, we need to clone here
                     sampled_push = self.push_button_cache[button]["sampled_push"].clone()
                     particles[push_pose] = sampled_push
-                    ik_result = self.push_button_cache[button]["ik_result"]
-                    particles[q] = ik_result.solution[:, 0].clone()
+                    _cache_entry = self.push_button_cache[button]
+                    ik_result = _cache_entry["ik_result"]
+                    # posture-selected branch if this cache entry has one (see
+                    # select_posture_branch); otherwise cuRobo's top seed, as before.
+                    _cached_q = _cache_entry.get("q_posture")
+                    particles[q] = (ik_result.solution[:, 0] if _cached_q is None else _cached_q).clone()
                     deferred_params.remove(q)
                     log_debug(
                         f"{header}. Using cached push poses for {button}. {ik_result.success.sum()}/{num_particles} success"
@@ -533,11 +737,16 @@ class ParticleInitializer:
 
                 # Solve IK with cuRobo
                 world_from_ee = Pose.from_matrix(world_from_ee)
-                ik_result = world.ik_solver.solve_batch(world_from_ee, seed_config=None)  # TODO: seeding
+                ik_result = world.ik_solver.solve_batch(
+                    world_from_ee, seed_config=None,
+                    return_seeds=max(1, config.posture_selection_seeds),
+                )
                 log_debug(
                     f"{header}. IK success: {ik_result.success.sum()}/{num_particles}, took {ik_result.solve_time:.2f}s"
                 )
-                particles[q] = ik_result.solution[:, 0]
+                particles[q] = select_posture_branch(
+                    ik_result, world_from_ee, world.ik_solver, config
+                )
                 deferred_params.remove(q)
 
                 # Failed subgraph!
@@ -546,7 +755,11 @@ class ParticleInitializer:
 
                 # Cache the push poses
                 if config.cache_subgraphs:
-                    self.push_button_cache[button] = {"sampled_push": sampled_push, "ik_result": ik_result}
+                    self.push_button_cache[button] = {
+                        "sampled_push": sampled_push,
+                        "ik_result": ik_result,
+                        "q_posture": particles[q],
+                    }
 
             # Push Button with Stick
             elif op_name == PushStick.name:
@@ -573,8 +786,12 @@ class ParticleInitializer:
                     # important, we need to clone here
                     sampled_push = self.push_stick_cache[(button, stick_name)]["sampled_push"].clone()
                     particles[push_pose] = sampled_push
-                    ik_result = self.push_stick_cache[(button, stick_name)]["ik_result"]
-                    particles[q] = ik_result.solution[:, 0].clone()
+                    _cache_entry = self.push_stick_cache[(button, stick_name)]
+                    ik_result = _cache_entry["ik_result"]
+                    # posture-selected branch if this cache entry has one (see
+                    # select_posture_branch); otherwise cuRobo's top seed, as before.
+                    _cached_q = _cache_entry.get("q_posture")
+                    particles[q] = (ik_result.solution[:, 0] if _cached_q is None else _cached_q).clone()
                     deferred_params.remove(q)
 
                     log_debug(
@@ -634,11 +851,16 @@ class ParticleInitializer:
 
                 # Solve IK with cuRobo
                 world_from_ee = Pose.from_matrix(world_from_ee)
-                ik_result = world.ik_solver.solve_batch(world_from_ee, seed_config=None)  # TODO: seeding
+                ik_result = world.ik_solver.solve_batch(
+                    world_from_ee, seed_config=None,
+                    return_seeds=max(1, config.posture_selection_seeds),
+                )
                 log_debug(
                     f"{header}. IK success: {ik_result.success.sum()}/{num_particles}, took {ik_result.solve_time:.2f}s"
                 )
-                particles[q] = ik_result.solution[:, 0]
+                particles[q] = select_posture_branch(
+                    ik_result, world_from_ee, world.ik_solver, config
+                )
                 deferred_params.remove(q)
 
                 # Store in cache
@@ -646,6 +868,7 @@ class ParticleInitializer:
                     self.push_stick_cache[(button, stick_name)] = {
                         "sampled_push": sampled_push,
                         "ik_result": ik_result,
+                        "q_posture": particles[q],
                         "grasp": particles[grasp],
                     }
 

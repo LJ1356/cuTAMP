@@ -92,11 +92,13 @@ class CostFunction:
                 else:
                     type_to_list[co.type].append(co)
 
-        # GraspCost(obj, grasp): orientation-only "least change in EE pose" soft cost. Charges the
-        # geodesic angle between each grasp's end-effector orientation and the robot's INITIAL EE
-        # orientation (FK of world.q_init), so the planner prefers grasps that reorient the wrist
-        # least. grasp is the action param (params[1]); we index world_from_ee_desired at its
-        # timestep in grasp_orientation_costs. Only active when a multiplier is set (opt-in).
+        # GraspCost(obj, grasp): soft costs scoring the grasp itself, each independently opt-in (see
+        # grasp_soft_costs). `grasp_rot_change` charges the geodesic angle between the grasp's
+        # end-effector orientation and the robot's INITIAL EE orientation (FK of world.q_init), so the
+        # planner prefers grasps that reorient the wrist least; it indexes world_from_ee_desired at the
+        # grasp's timestep, which is why the initial orientation is cached below. `grasp_center_offset`
+        # charges how far off-center the grasp sits on the object and needs no such setup -- it reads
+        # obj_from_grasp straight off the rollout. grasp is the action param (params[1]).
         self.grasp_cost_action_names = [cost.params[1] for cost in self.grasp_costs]
         self.init_ee_rotmat = None
         self.init_ee_rotmat_arms = None
@@ -564,8 +566,72 @@ class CostFunction:
         }
         return traj_cost
 
+    def grasp_soft_costs(self, rollout: Rollout) -> Union[dict, None]:
+        """All GraspCost terms, emitted together (cost_dict is keyed by cost TYPE, so one dict per type).
+
+        Each term is independently gated by a config flag, because the reducer treats an ABSENT
+        multiplier as weight 1.0 -- an always-emitted value would silently change every caller's
+        objective. Returns None when the skeleton has no grasps or no term is enabled.
+
+          - ``grasp_rot_change``    (config.grasp_orientation_cost) -- see grasp_orientation_costs
+          - ``grasp_center_offset`` (config.grasp_center_cost)      -- see grasp_center_costs
+        """
+        if not self.grasp_costs:
+            return None
+        values = {}
+        rot = self.grasp_orientation_costs(rollout)
+        if rot is not None:
+            values.update(rot)
+        center = self.grasp_center_costs(rollout)
+        if center is not None:
+            values.update(center)
+        if not values:
+            return None
+        return {"type": "cost", "costs": self.grasp_costs, "values": values}
+
+    def grasp_center_costs(self, rollout: Rollout) -> Union[dict, None]:
+        """``grasp_center_offset`` - horizontal distance from the object's origin to the grasp's TCP.
+
+        Incentivizes grasps nearer the middle of the object instead of out at an edge, where the lever
+        arm between the contact and the object's center of mass makes the hold prone to slipping or
+        pivoting. Charged in METERS, per grasp parameter.
+
+        The grasp parameter IS ``obj_from_grasp``, so its translation is already the TCP expressed in
+        the object frame -- no timestep or arm indexing is needed, and the value is identical at every
+        rollout timestep (the grasp is a rigid offset). Grasp parameters are not optimized
+        (``types_to_optimize = {Pose, Conf}``), so this term acts purely as a selection signal over the
+        discrete candidates the particles were initialized with.
+
+        Only the xy components are charged. For TiPToP's perceived meshes the object frame origin is
+        the mean of the reconstructed vertices (``perception/utils.py::convert_trimesh_to_curobo_mesh``),
+        which comes from a single-view point cloud: the z component of that centroid is biased toward
+        the camera-facing surface, while xy is comparatively unbiased. xy is also the axis the
+        instability actually lives on -- an off-center grasp in the table plane is what lets gravity
+        pivot the object out of the fingers.
+
+        Two caveats, both about WHICH objects this is a stability signal for:
+
+        - Hollow objects (bowl, plate, ring). The origin sits in empty space, so every reachable grasp
+          is on the rim -- but they are NOT equidistant from it: measured over saved TiPToP runs, the
+          rim grasps on one bowl span 2-5 cm of offset, the same range as the toys this term is meant
+          to fix. Because a single-view reconstruction pulls the vertex centroid toward the
+          camera-facing wall, what the term then ranks is proximity to a view-biased centroid, which
+          has nothing to do with stability. Prefer leaving it off for bowl/plate tasks.
+        - Large objects. The charge is raw meters with no normalization by extent, deliberately: that
+          is what makes the END of a long object expensive, which normalizing would undo. The cost is
+          therefore a tiebreaker on a small toy (3-5 cm of spread across its candidates) and decisive
+          on a big one (a potted plant spans ~14 cm), at one and the same weight.
+        """
+        if not self.grasp_costs or not self.config.grasp_center_cost:
+            return None
+        obj_from_grasp = rollout["grasp_to_obj_from_grasp"]
+        offsets = torch.stack(
+            [obj_from_grasp[name][:, :2, 3] for name in self.grasp_cost_action_names], dim=1
+        )  # (b, k, 2)
+        return {"grasp_center_offset": torch.linalg.norm(offsets, dim=-1)}  # (b, k)
+
     def grasp_orientation_costs(self, rollout: Rollout) -> Union[dict, None]:
-        """GraspCost - geodesic angle between each grasp's EE orientation and the initial EE orientation.
+        """``grasp_rot_change`` - geodesic angle between each grasp's EE orientation and the initial one.
 
         Incentivizes grasps that require the least change in end-effector orientation from the robot's
         starting pose. Returns None unless the skeleton has grasps AND config.grasp_orientation_cost is
@@ -588,18 +654,17 @@ class CostFunction:
             init_rotmat = self.init_ee_rotmat.view(1, 1, 3, 3).expand_as(grasp_rotmat)
         # Geodesic distance on SO(3) in radians; roma clamps internally to keep gradients stable.
         grasp_rot_change = roma.rotmat_geodesic_distance(grasp_rotmat, init_rotmat)  # (b, k)
-        return {
-            "type": "cost",
-            "costs": self.grasp_costs,
-            "values": {"grasp_rot_change": grasp_rot_change},
-        }
+        return {"grasp_rot_change": grasp_rot_change}
 
     def collision_costs(self, rollout: Rollout, obj_to_spheres: Dict[str, Float[torch.Tensor, "b t n 4"]]) -> dict:
         """Collision costs."""
         # Robot to world
         robot_spheres = rollout["robot_spheres"]
         with torch.profiler.record_function("coll::robot_to_world"):
-            coll_values = {"robot_to_world": self.world.collision_fn(robot_spheres)}
+            # robot_collision_fn, not collision_fn: the arm is allowed to reach INTO the surfaces
+            # listed in world.pick_transparent (see TAMPWorld). movable_to_world below keeps the
+            # full checker, so a PLACED object is still screened against those surfaces.
+            coll_values = {"robot_to_world": self.world.robot_collision_fn(robot_spheres)}
 
         # Collision between movables and world — batch all activated objects in one collision_fn call,
         # then mask out timesteps before each object's first placement. The motion solver handles this
@@ -728,9 +793,10 @@ class CostFunction:
             traj_cost = self.trajectory_costs(rollout)
         add_cost(TrajectoryLength.type, traj_cost)
 
-        # Grasp orientation-change cost (opt-in; only reduced when a GraspCost multiplier is set)
-        with torch.profiler.record_function("cost::grasp_orientation"):
-            grasp_cost = self.grasp_orientation_costs(rollout)
+        # Grasp soft costs -- orientation change and/or off-center offset. Both are opt-in, and only
+        # reduced when the matching GraspCost multiplier is set.
+        with torch.profiler.record_function("cost::grasp"):
+            grasp_cost = self.grasp_soft_costs(rollout)
         add_cost(GraspCost.type, grasp_cost)
 
         # Get collision spheres for movable objects

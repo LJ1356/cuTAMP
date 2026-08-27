@@ -463,6 +463,7 @@ def run_cutamp(
     experiment_dir: Optional[Path] = None,
     reuse_plan_skeleton: Optional[PlanSkeleton] = None,
     plan_out: Optional[dict] = None,
+    q_return: Optional[List[float]] = None,
 ):
     """Overall cuTAMP algorithm implementation.
 
@@ -477,7 +478,16 @@ def run_cutamp(
     ``plan_out``, if given, is filled in with {"plan_skeleton": ...} -- the skeleton behind the
     returned plan, so a caller can feed it back in later. Returned this way rather than in the
     return tuple, which callers unpack positionally.
+
+    ``q_return`` overrides where the closing GoToInitial drives to; see ``solve_curobo``. Single-arm
+    only -- the dual solver builds its return leg from the named q0 rather than a configuration.
+    It takes precedence over ``config.q_home``, being the per-CALL answer to the same question the
+    config answers per-RUN: goal clearing plans two legs against one config, and the task leg has to
+    return to where the EPISODE started, not to where the clearing leg handed over. Neither is
+    consulted when ``config.return_home`` is off, which drops the closing drive altogether.
     """
+    if q_return is not None and config.arm_mode == "dual":
+        raise NotImplementedError("q_return is not supported for dual-arm plans")
     if config.m2t2_grasps and not grasps:
         _log.warning(f"M2T2 grasps enabled but no grasps provided! Falling back to grasp_dof={config.grasp_dof}")
 
@@ -737,6 +747,7 @@ def run_cutamp(
                             obj_to_initial_pose=obj_to_initial_pose,
                             timeline=f"curobo_{curr_idx}",
                             motion_gen=motion_gen,
+                            **({} if solver is solve_curobo_dual else {"q_return": q_return}),
                         )
                         _log.info("Successful plan found!")
                         failure_reason = None
